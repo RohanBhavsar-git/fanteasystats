@@ -9376,19 +9376,39 @@
     //   SUSP      = 3 (won't play)
     const RISK_SEVERITY = { IR: 3, O: 3, D: 2, Q: 1, PUP: 1, NA: 1, SUSP: 3 };
 
-    // Play-probability heuristic based on NFL injury-status convention.
-    // These are league-wide historical averages — actual probability depends
-    // on body part, practice participation, time of week — none of which
-    // Sleeper exposes. We surface a range to make the uncertainty visible.
+    // Play-probability by injury designation.
+    //
+    // Q/D/O are now MEASURED, not guessed: real play rate (a real
+    // weekly-stats row that week, vs. none) for every real QB/RB/WR/TE/K
+    // report_status entry, nflreadpy's load_injuries() REG season
+    // 2009-2025 (27,778 real report rows; see PROJECT_CONTEXT.md's
+    // Practice Report findings and notebooks/08_practice_report.ipynb for
+    // the full methodology). These replace an earlier hand-picked
+    // heuristic (~75%/~25%/0%) that predated this data existing — the
+    // Questionable number in particular moved a lot (75% -> 57%), and it's
+    // still a LEAGUE-WIDE AVERAGE, not this specific player's odds (real
+    // probability still depends on body part, practice participation, and
+    // time of week, none of which this alone captures) — every tooltip
+    // below says so explicitly, plus the real sample size behind it.
+    //
+    // IR/PUP/NA/SUSP are deliberately NOT touched — nflverse's weekly
+    // report has no equivalent concept at all (report_status is only ever
+    // Questionable/Doubtful/Out/Probable; IR/PUP/suspension are roster-
+    // level designations the weekly practice report never carries), so
+    // there's no real rate to measure here the way there was for Q/D/O.
+    // Their 0% reflects an actual NFL rule/mechanism (IR's 4-game minimum,
+    // PUP's practice/play restriction, a suspension's formal
+    // ineligibility) rather than an estimate — more data wouldn't refine a
+    // rule, so these stay exactly as they were.
     function playProbability(status) {
       switch (status) {
-        case 'Q':    return { pct: 75, label: '~75%', tone: 'caution',  tip: 'Questionable: roughly 3 in 4 players listed Q end up playing. Watch inactives ~90 min pre-kickoff.' };
-        case 'D':    return { pct: 25, label: '~25%', tone: 'severe',   tip: 'Doubtful: historically ~25% of D-listed players play. Likely zero — consider benching.' };
-        case 'O':    return { pct: 0,  label: '0%',   tone: 'severe',   tip: 'Out: ruled out for this game. Will not play.' };
-        case 'IR':   return { pct: 0,  label: '0%',   tone: 'critical', tip: 'Injured Reserve: out at least 4 games. Cannot play.' };
+        case 'Q':    return { pct: 57, label: '~57%', tone: 'caution',  tip: 'Questionable: measured play rate is ~57% (7,180 real player-weeks, 2009-2025) — a league-wide average, not this player\'s own odds. Watch inactives ~90 min pre-kickoff.' };
+        case 'D':    return { pct: 1,  label: '~1%',  tone: 'severe',   tip: 'Doubtful: measured play rate is ~1% (1,057 real player-weeks, 2009-2025) — historically almost never plays. Bench.' };
+        case 'O':    return { pct: 0,  label: '0%',   tone: 'severe',   tip: 'Out: measured play rate is ~0.1% (5,161 real player-weeks, 2009-2025) — ruled out for this game, essentially never plays anyway.' };
+        case 'IR':   return { pct: 0,  label: '0%',   tone: 'critical', tip: 'Injured Reserve: out at least 4 games by NFL rule. Cannot play.' };
         case 'PUP':  return { pct: 0,  label: '0%',   tone: 'critical', tip: 'PUP list: cannot practice or play until activated.' };
         case 'NA':   return { pct: 0,  label: '0%',   tone: 'severe',   tip: 'Inactive: declared inactive for this game.' };
-        case 'SUSP': return { pct: 0,  label: '0%',   tone: 'severe',   tip: 'Suspended: ineligible to play.' };
+        case 'SUSP': return { pct: 0,  label: '0%',   tone: 'severe',   tip: 'Suspended: ineligible to play by league rule.' };
         default:     return { pct: 100,label: '100%', tone: '',         tip: '' };
       }
     }
@@ -9550,7 +9570,7 @@
           <div class="lineup-risk-header">
             <div>
               <div class="lineup-risk-title">⚠️ Lineup Risks</div>
-              <div class="lineup-risk-summary">${totalRiskCount} starter${totalRiskCount === 1 ? '' : 's'}${totalHighRiskCount ? ` · <strong style="color: var(--danger);">${totalHighRiskCount} severe</strong>` : ''}<br/><span style="font-size: 10px; color: var(--text-muted);">% = est. play rate (hover for details)</span></div>
+              <div class="lineup-risk-summary">${totalRiskCount} starter${totalRiskCount === 1 ? '' : 's'}${totalHighRiskCount ? ` · <strong style="color: var(--danger);">${totalHighRiskCount} severe</strong>` : ''}<br/><span style="font-size: 10px; color: var(--text-muted);">% = play rate, league-wide average (hover for details)</span></div>
             </div>
             <select class="filter-select" id="risk-week-select" style="font-size: 12px; padding: 4px 24px 4px 8px;">
               ${availableWeeks.map(w => `<option value="${w}"${w === riskWeek ? ' selected' : ''}>Wk ${w}${w === state.currentWeek ? ' · Current' : ''}</option>`).join('')}
