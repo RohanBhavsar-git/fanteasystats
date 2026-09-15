@@ -64,9 +64,11 @@ from src.export import (  # noqa: E402
     validate_export, validate_simulation,
 )
 from src.ingest import (  # noqa: E402
-    DATA_OUTPUT, DEFAULT_LEAGUE_ID, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
-    get_sleeper_matchups, get_sleeper_players, get_sleeper_projections, get_sleeper_rosters, get_weekly_stats,
+    DATA_OUTPUT, DEFAULT_LEAGUE_ID, get_id_crosswalk, get_injuries, get_injuries_source_updated_at, get_pbp,
+    get_schedule, get_sleeper_league, get_sleeper_matchups, get_sleeper_players, get_sleeper_projections,
+    get_sleeper_rosters, get_weekly_stats,
 )
+from src.injury_report import build_practice_report_export  # noqa: E402
 from src.kicker_defense import build_defense_season_stats, build_kicker_season_stats  # noqa: E402
 from src.model import predict_quantiles_with_models, sleeper_projected_points  # noqa: E402
 from src.pipeline import _is_unpublished_season_error, build_raw_features, build_weekly_scored  # noqa: E402
@@ -450,6 +452,20 @@ def main() -> None:
     )
     payload = merge_kicker_and_defense_entries(payload, kicker_export, defense_export)
     print(f"    crosswalk match rate: {crosswalk_report}")
+
+    # Practice Report -- nflverse's own weekly injury/practice data, real
+    # for every REG week reported so far this season (not just target_week),
+    # so a manager browsing an already-played week sees that week's real
+    # report too. Independent of the projection pipeline above -- see
+    # src/injury_report.py's module docstring for why it's bolted on here
+    # rather than threaded through assemble_player_advanced_stats.
+    injuries_current = get_injuries([current_season], refresh=True)
+    payload["practice_report"] = build_practice_report_export(
+        injuries_current, crosswalk, current_season, get_injuries_source_updated_at(current_season)
+    )
+    n_practice_weeks = len(payload["practice_report"]["weeks"])
+    print(f"    practice_report: {n_practice_weeks} week(s) of real reports, "
+          f"source_updated_at={payload['practice_report']['source_updated_at']}")
 
     validation_report = validate_export(payload, crosswalk)
     print(f"    validation: {validation_report}")

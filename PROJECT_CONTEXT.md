@@ -211,6 +211,33 @@ This document captures the "why" behind the FanTeasy Stats project so a new conv
 > bucket counts, the fumble-attribution fix, and two flagged-not-fixed
 > items (a pre-existing QB-scramble dilution of the RB/WR/TE carry rate
 > table, and Family 5B still not extended to QB).
+> **Practice Report (Sep 2026) is also done** — a new dashboard tab
+> reading `nflreadpy.load_injuries()` (`src/ingest.py::get_injuries`,
+> `src/injury_report.py`), independent of the projection pipeline entirely.
+> Two things checked directly before building, both real findings, not
+> assumptions: (1) nflverse's `report_status`/`practice_status` is NOT
+> redundant with the Injury tab's Sleeper-sourced `injury_status` — real
+> rostered players showed disagreement in both directions (nflverse's
+> official report already Questionable/Doubtful/Out while Sleeper still
+> reads healthy, and the reverse), so the new tab shows both side by side
+> rather than replacing anything; (2) practice participation is measurably
+> predictive across 2018-2025 — a "Did Not Participate" week preceded
+> actually playing only ~16% of the time (vs. ~84% for Full), and
+> conditional on playing anyway there's a real ~5-15% production/snap-share
+> discount vs. that player's own healthy-week baseline (confirmed
+> independently via fantasy points AND snap share). The official
+> `report_status` also turned out to be a much sharper "will they play"
+> signal than the Lineup Risks panel's existing hand-picked heuristic
+> assumes (measured ~58% for Questionable and <1% for Doubtful, vs. the
+> panel's ~75%/~25%) — flagged, not changed; this notebook doesn't touch
+> that panel. Reported, not wired into the model, per this feature's own
+> scope. Also settled a real doc/data mismatch: `date_modified` does not
+> exist anywhere in this source (checked at both the nflreadpy layer and
+> the raw nflverse-data release) — the tab surfaces the whole season
+> file's own last-regenerated timestamp instead (file-level freshness, not
+> per-row), stated as such rather than implying day-level precision this
+> source doesn't have. See **Practice Report findings** below and
+> `notebooks/08_practice_report.ipynb` for the full tables.
 > See **Verification status** near the end before treating any pipeline
 > claim as settled.
 
@@ -326,6 +353,15 @@ These are non-negotiable — they've shaped every decision we've made:
 - 4 KPI cards with icon tiles (Total Injured, Out/IR, On Rosters, Most Affected Position)
 - **This Week's Lineup Risks side panel** (replaces earlier injury news attempt): per-team lineup risks with severity scoring, week filter dropdown, play-probability pills (~75% for Q, ~25% for D, 0% for IR/Out) with status-specific hover tooltips
 - Injury news panel was tried and removed — Sleeper's `injury_notes` is often just 1-word body-part descriptors, not narrative news. The lineup-risks panel is the better use of that real estate.
+
+### Practice Report tab
+- Real nflverse weekly injury/practice data (`report_status`/`practice_status`/primary+secondary injury per source, both official-report and practice-participation), a DIFFERENT source than the Injury tab above (Sleeper's own `injury_status`) — see **Practice Report findings** for why both are shown rather than one replacing the other
+- Week selector, defaulting to the most recent week nflverse has actually published a report for (not necessarily `state.currentWeek`)
+- Filters: search, position (QB/RB/WR/TE/K), NFL team, rostered-in-this-league — rostered checked against `state.rosters`' own player lists, not the dashboard's trimmed `state.players`, so a practice-squad/inactive player who's real on the report but absent from that trimmed list still shows correctly as a free agent
+- Default sort is a composite "relevance" score (rostered first, then official report-status severity, then practice-status severity) so the players who matter surface first instead of being buried in a 32-team-wide report; column headers are independently sortable
+- Practice/Report columns are separate color-coded badges (never collapsed into one "status") reusing the existing `game-status-pill`-style visual language; Injury column shows `practice_primary_injury` as the primary value, annotated with the official report's injury only on the rare (~0.2% of rows) real occasions it names a different issue
+- A persistent banner states three things plainly: this is WEEKLY data with no Wednesday/Thursday/Friday breakdown; the whole season file's own last-regenerated timestamp (the honest substitute for a per-row `date_modified`, which doesn't exist in this source); and that this is a different source than the Injury tab, so a disagreement is expected, not a bug
+- Sleeper Status column cross-references the Injury tab's own `injury_status` inline, so a real disagreement between the two sources is visible in the same row rather than requiring a tab switch to notice
 
 ### Players tab
 - Real Sleeper player DB (~11k players filtered to active fantasy positions)
@@ -3101,6 +3137,100 @@ Things that took real conversation to arrive at — a new Claude should NOT re-l
 
 ---
 
+## Practice Report findings (Sep 2026)
+
+A new dashboard tab (`renderPracticeReportView` in `index.html`) over
+nflverse's official weekly injury/practice report — `nflreadpy.load_
+injuries()`, wrapped by `src/ingest.py::get_injuries`/`get_injuries_
+source_updated_at` and `src/injury_report.py::build_practice_report_
+export`. Deliberately independent of the projection pipeline — no
+predictions/usage/xfp merge, bolted onto the export payload as its own
+top-level `practice_report` key the same way `simulation`/`kicker_stats`
+already are, not threaded through `assemble_player_advanced_stats`.
+
+**Schema reality check, before anything got built.** The task that
+specified this feature described a `date_modified` column. It does not
+exist — checked at both the nflreadpy wrapper level AND by pulling the raw
+`injuries_2025.parquet` release directly from nflverse-data's GitHub
+release, bypassing nflreadpy entirely (see `notebooks/08_practice_report.
+ipynb` §0). There is also no Wednesday/Thursday/Friday breakdown anywhere
+in this source at any level — `practice_status` is one value per (player,
+week). The honest substitute for freshness: `get_injuries_source_updated_
+at()` hits GitHub's Releases API directly for the season file's own
+`updated_at` timestamp — real, but file-level, not per-row. The dashboard
+banner states this plainly rather than implying day-level or per-row
+precision the source doesn't have.
+
+**Finding 1 — this does NOT duplicate the Injury tab's Sleeper-sourced
+`injury_status`.** Cross-referenced every real rostered player in this
+league against the live 2026 week-1 report (via the DynastyProcess
+crosswalk, `get_id_crosswalk`). Real, frequent disagreement in both
+directions: nflverse's official `report_status` already showing
+Questionable/Doubtful/Out while Sleeper's `injury_status` for the same
+player still reads healthy (Sleeper hasn't caught up to this week's
+report), and the reverse (Sleeper flags Questionable with nflverse's
+`report_status` currently null for that player). A player Sleeper marks
+`PUP` — a roster-level, off-season designation — can carry a real, current
+`practice_status` (e.g. "Limited Participation") as they work back, which
+the static PUP tag alone never shows. Conclusion: these are complementary
+signals from different providers on different update schedules, not the
+same information under two names — the tab shows both side by side (a
+"Sleeper Status" column cross-references the Injury tab's own field
+inline) rather than one replacing the other.
+
+**Finding 2 — `report_primary_injury` vs. `practice_primary_injury`
+occasionally diverge in a genuinely useful way.** Of 60,310 report-rows
+(2009-2026) with both fields populated, 123 (0.20%) name different issues.
+The dominant real pattern: an **illness** driving that week's official
+game designation, layered on top of a separately-tracked physical injury
+that's what the practice report actually names (e.g. Ja'Marr Chase, 2025
+Week 6 — official report cites Illness, practice report still lists his
+tracked issue as "Not injury related - resting player"). A smaller pattern
+is pure roster management with no injury involved at all (7 Eagles resting
+ahead of the 2024 playoffs, "coach's decision" vs. "resting player").
+Design decision this drove: the Injury column shows `practice_primary_
+injury` as the primary value (populated far more often) and adds a small
+"Official report: X" annotation only on the rare real occasions the two
+name different things — not a permanent second column that would be blank
+99.8% of the time.
+
+**Finding 3 — practice participation is measurably predictive, not just
+informational.** Full walk-forward-style check across 2018-2025 (QB/RB/WR/
+TE, REG season only — `game_type == 'REG'`, since `season_type` turned out
+to be populated only for 2025-2026 in this source, a real data-quality
+finding of its own, checked and worked around before it silently dropped
+84,684 of 90,934 rows from an early draft of this analysis). See
+`notebooks/08_practice_report.ipynb` for the full tables.
+
+- **Play rate tracks practice status monotonically**: Did Not Participate
+  → ~16% play rate that week (n=3,681); Limited → ~62% (n=3,406); Full →
+  ~84% (n=6,206).
+- **The official `report_status` is a much sharper "will they play" signal
+  than practice status alone**: Out → 0.04% play rate (n=2,571); Doubtful →
+  0.7% (n=407); Questionable → a real coin flip at 58.4% (n=3,336); no
+  designation → 84.8% (n=7,044, the population baseline). This measurably
+  revises the Lineup Risks panel's existing hand-picked `playProbability()`
+  heuristic (index.html), which currently assumes ~75% for Questionable
+  and ~25% for Doubtful — the real numbers are materially different.
+  **Flagged, not changed** — updating that panel is a separate, deliberate
+  decision outside this feature's scope.
+- **Conditional on playing anyway, there's a real (if modest) production
+  discount**, confirmed independently via two different metrics (agreement
+  between them is what makes this a real effect, not noise from one
+  measure): a Limited-but-played week lands at ~94-95% of that player's own
+  healthy-week median, both in fantasy points AND in snap share (via a
+  separate PFR-id crosswalk join to `nflreadpy.load_snap_counts`); a
+  DNP-but-played week's discount is roughly triple that (~83-95% depending
+  on the metric).
+
+**Not wired into the projection model.** Per this feature's own scope and
+CLAUDE.md's model boundary (tabular regression on real usage/efficiency
+features) — this is a real, reportable signal, not yet vetted the way
+Team Tendencies/Family 5B/Context Columns were (a deliberate walk-forward
+test against the committed baseline before being added to `FEATURE_
+COLUMNS_BY_POSITION`). A future practice-report feature family would
+follow that same precedent, not skip it.
+
 ## Verification status
 
 Be precise about what's actually been confirmed, so a fresh session doesn't inherit
@@ -3143,6 +3273,7 @@ assumptions as facts.
 | Context Columns split (`VEGAS_SCHEDULE_OUTPUT_COLUMNS`/`WEATHER_OUTPUT_COLUMNS`, `src/usage.py`/`src/model.py`) is a real, position-differentiated improvement, not a re-labeling of the old block-level result | **Verified** — same walk-forward methodology as every other feature family in this pipeline (2024-2025 eval window, full 2018-2025 history). Splitting `CONTEXT_OUTPUT_COLUMNS` surfaced a real RB effect (−0.027 Vegas gain, +0.015 weather harm) the whole-block test had averaged into a false "noise" reading (−0.008); TE's block-level degradation held up unchanged when split (+0.022 Vegas, +0.028 weather, both real and same-direction). QB's proposed "Vegas + Team Tendencies, no weather" list was walk-forward-checked BEFORE being committed and found to regress the model by +0.073 MAE vs. the already-committed baseline (weather's solo effect is ~0, but its effect on top of Vegas+TT isn't) — QB keeps all three families instead, verified unchanged at 6.1738. Post-split re-verification against the real, wired `FEATURE_COLUMNS_BY_POSITION`: QB 6.1738 (exactly unchanged), RB 4.1519 (−0.019), WR 3.9299 (−0.009), TE 3.0055 (−0.008) — all four at or better than the pre-split committed baseline. `scripts/retrain.py`/`weekly_update.py`/`archive_season.py 2023/2024/2025` all re-run for real against the refreshed artifact; all 4 `validate_export` reports passed clean. See **Context Columns findings** for the full tables, the QB Vegas/Team-Tendencies redundancy factorial, and the methodological point about family-level ablations hiding opposite-signed sub-effects (flagged as untested at the sub-family level for Team Tendencies and Family 5B too). |
 | Team Tendencies and Family 5B sub-metric ablations (the two families flagged above as untested below the block level) don't change `FEATURE_COLUMNS_BY_POSITION`, and a real false-positive was caught before being retrained on | **Verified — and the verification process itself is the finding.** Same walk-forward methodology, both families split into their natural sub-metrics (Team Tendencies: PROE/pace/red-zone split/target distribution; Family 5B: unadjusted/schedule-adjusted). TE's Team Tendencies exclusion confirmed at the sub-metric level (all four hurt individually — no beneficial subset exists). A WR Team Tendencies candidate (−0.014, measured against a notebook-cached `data/processed/weekly_features.parquet` that had silently drifted from production — see the notebook-drift row below) was briefly implemented, then re-checked with a clean, single-build comparison against `build_feature_table(HISTORICAL_SEASONS, DEFAULT_LEAGUE_ID)` — the exact call `scripts/retrain.py` makes — and found to be +0.0009 (noise). Reverted before any retrain happened. RB's Family 5B and Team Tendencies sub-metric numbers were independently re-checked on the same clean path and reproduced within ±0.001 of their first measurement, confirming the WR case was an isolated data-source artifact, not a sign every number needed re-checking. Net: `FEATURE_COLUMNS_BY_POSITION` is unchanged from before this investigation; no retrain was triggered. See **Sub-Metric Ablation & the WR Data-Source Catch** for the full tables. |
 | `notebooks/03_usage_features.ipynb` matches `src/pipeline.py::build_feature_table`'s real production feature chain | **Verified — and was NOT true before this check.** The notebook's pipeline cell never got `add_team_tendency_features` added when Team Tendencies shipped; `data/processed/` being gitignored meant nothing caught it. Fixed (import + call added), re-run end to end (373 columns, exactly matching `build_feature_table`), and a static guard test added (`tests/test_pipeline.py::test_notebook_03_feature_chain_matches_build_feature_table`, regex-comparing `add_*_features` calls on both sides, no data dependency) so a future drift fails a test instead of silently producing an incomplete `weekly_features.parquet` again. This exact gap is what caused the WR false positive in the row above. |
+| Practice Report tab: `build_practice_report_export` produces correct real data, `date_modified` genuinely doesn't exist in this source, and the tab renders/filters/sorts correctly for both the live 2026 week and a completed 2025 week | **Verified** — schema absence of `date_modified` confirmed at both the nflreadpy layer and the raw nflverse-data GitHub release directly (bypassing nflreadpy). Real committed exports patched with real data (not a re-run of the full slow prediction pipeline, which this feature doesn't touch): live `player_advanced_stats.json` carries 1 real week (52 skill-position report rows, `source_updated_at` matching the real GitHub release asset timestamp fetched live); the 2025 archive carries all 18 real weeks (1,790 total rows). A real JSON-round-trip bug was caught and fixed in the process: pandas silently reverts a `None` back to `NaN` on assignment into an all-null float64 column (`report_secondary_injury` most often), which produced a literal non-JSON `NaN` token — fixed by casting to `object` dtype before the null-fill. Frontend verified via Playwright against the real production data: season selector still defaults to 2026; the search box types forward correctly (built with the debounced-partial-render pattern from the start, not retrofitted); rostered/team/position filters and column-sort headers (including severity-ranked sort on the Practice/Report columns) all produce correct results; a row click opens the real Player Detail page; the default "relevance" sort correctly surfaces rostered players before free agents and higher-severity designations first within each group. Because this sandbox's headless Chromium is blocked by ESPN's bot detection (same pre-existing limitation noted elsewhere), the real live/upcoming practice-status branch was verified by intercepting the scoreboard request with a REAL just-captured ESPN snapshot (one real live game, DEN@KC in the 3rd quarter, week 1 2026) rather than a fabricated one — resulted in exactly 9 "Live" pills, matching the count of real DEN/KC starters across that week's matchups precisely; a "Not Started" state was confirmed by patching one real game's status field to `pre` in that same real snapshot. A real cross-provider discrepancy row (Ja'Marr Chase, 2025 Week 6, Illness vs. a differently-worded practice injury) was located and confirmed to render its "Official report:" annotation correctly. Not yet run for real on GitHub Actions infrastructure — `scripts/weekly_update.py`/`archive_season.py` were updated to build this key themselves going forward, but that path itself hasn't had a real `workflow_dispatch` since. |
 | QB xFP (`src/usage.py`'s dropback + designed-rush bucket model) is leakage-free, fumble/pick-six attribution is correct, and `fp_over_expected` behaves like a real luck signal for QB, not a re-labeled non-signal | **Verified** — 6 new white-box unit tests pass (`tests/test_no_leakage.py`: sack-yardage exclusion from passing_yards, scramble-yardage routing to rushing, fumble attribution to the QB not the receiver, pick-six detection's `td_team == defteam` gate, kneel/scramble/non-QB exclusion from the designed-rush population, QB-id filtering), plus the existing black-box future-truncation tests (`test_xfp_no_future_leakage`/`test_xfp_idempotent`) pass unchanged since they already exercised the full `weekly_scored` frame including QB rows. Split-half correlation (odd/even weeks within each player-season, >=3 games/half): QB raw `custom_points` r=0.7033 vs. `fp_over_expected` r=0.3676 (n=318) — a real, substantial drop, the metric passes the check. Reproduced the same test fresh for RB/WR/TE (pooled r=0.8048 raw vs. 0.1892 `fp_over_expected`, n=2,899-2,905) since the "0.22 vs. 0.73" figures once recalled for the original xFP weren't found committed anywhere to verify against directly. Real 2025 season spot-check via a locally-regenerated `scripts/archive_season.py 2025` (not a scratch computation) matches known outcomes: Josh Allen +80.5, Drake Maye +72.6, Matthew Stafford +58.0 at the positive extreme (real efficient/high-conversion 2025 seasons); Cam Ward −58.5, Geno Smith −43.4 at the negative extreme (real, widely-reported down seasons). Playwright-verified live: the Dashboard's xFP Regression panel and the Players table's FP Over Exp column both now show real QB values mixed naturally with RB/WR/TE (no separate QB section, no dashes), zero console errors. See **QB xFP findings** for the full bucket counts, the fumble-attribution fix, the scramble-dilution measurement (confirmed negligible, left as-is), and the QB-confidence UI copy update. |
 
 ## What's outstanding
@@ -3165,6 +3296,7 @@ assumptions as facts.
 - **`data/output/player_advanced_stats.json` now regenerates automatically** via `weekly-update.yml` (Tuesdays in-season, or `workflow_dispatch` any time) — the old "re-run `07_export_json.ipynb` by hand after the draft" step is superseded by this for ongoing updates; the notebook still exists and still works for manual/exploratory runs.
 - ~~The committed exports don't have Family 5B's `matchup`/`defense_rankings` keys yet.~~ **Done** — `scripts/weekly_update.py` and `scripts/archive_season.py 2025/2024/2023` were all re-run for real; the live export and all 3 archives now carry real `matchup`/`defense_rankings`/`weekly_matchup` data (the live export's is honestly empty since 2026 has zero games played yet). See **Family 5B findings**.
 - ~~QB xFP is not yet a model feature.~~ **Measured (not applied) — doesn't help under the real current baseline.** QB-xFP-rolled added alone to the committed QB feature list: +0.0004 MAE (noise). See **QB xFP as a Model Feature findings**.
+- **Practice Report's `weekly_update.py`/`archive_season.py` wiring hasn't run on real GitHub Actions infrastructure yet** — the committed exports' `practice_report` key was patched in directly (real data, same `build_practice_report_export` call the scripts now make, just without re-running the full slow prediction pipeline around it); the scripts themselves need one real `workflow_dispatch` to confirm the wiring holds end to end in CI. Also worth a future, deliberate look (not done here, per this feature's own scope): the Lineup Risks panel's hand-picked `playProbability()` heuristic vs. the real measured report_status play rates in **Practice Report findings**.
 - ~~Family 5B (opponent strength) still doesn't cover QB.~~ **Built (as a one-line `OPP_STRENGTH_POSITIONS` patch, not committed) and measured — a real degradation under the real current baseline.** Added alone: +0.078 MAE (worse). See **QB xFP as a Model Feature findings** for the full factorial and why both candidates substantially overlap with Team Tendencies and with each other.
 - ~~A pre-existing imprecision in RB/WR/TE's own xFP, found while building the QB version: `_carry_play_frame`'s mask isn't QB-gated, so a scrambling QB's carries have always been pooled into the RB/WR/TE carry bucket RATE TABLE too.~~ **Measured, not fixed — confirmed negligible.** Bucket rates move a real 1.8-9.5% with scrambles excluded, but the downstream effect on actual RB/WR/TE `fp_over_expected` is negligible (mean abs diff 0.0555 pts across 40,331 player-weeks; split-half correlation moves by only 0.0016). Left as-is deliberately, per the measured result — see **QB xFP findings**.
 - **The committed model artifact (`models/fanteasy_model.joblib`) predates Family 5B** — it was trained before `FEATURE_COLUMNS` grew the four opponent-strength columns, so `weekly_update.py`'s actual point/floor/ceiling predictions are NOT yet using this feature as a model input (the artifact is self-describing and uses its own saved `feature_columns`, by design — see `predict_target_week_from_artifact`'s docstring). The `matchup`/`defense_rankings` export keys themselves are unaffected (built independently of the model artifact) and ARE real. `retrain.yml`'s next run will train against the new feature set automatically, no code change needed — not triggered this session (a real retrain wasn't requested).

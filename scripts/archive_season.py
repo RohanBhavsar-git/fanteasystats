@@ -56,9 +56,10 @@ from src.export import (  # noqa: E402
     predict_target_week_from_artifact, validate_export,
 )
 from src.ingest import (  # noqa: E402
-    DATA_OUTPUT, SEASON_LEAGUE_IDS, get_id_crosswalk, get_pbp, get_schedule, get_sleeper_league,
-    get_sleeper_rosters, get_weekly_stats,
+    DATA_OUTPUT, SEASON_LEAGUE_IDS, get_id_crosswalk, get_injuries, get_injuries_source_updated_at, get_pbp,
+    get_schedule, get_sleeper_league, get_sleeper_rosters, get_weekly_stats,
 )
+from src.injury_report import build_practice_report_export  # noqa: E402
 from src.kicker_defense import build_defense_season_stats, build_kicker_season_stats  # noqa: E402
 
 TOP_N_FREE_AGENTS = 300
@@ -231,6 +232,18 @@ def main() -> None:
     payload["simulation"] = None  # a hypothetical post-season week has no real matchups to simulate
     payload = merge_kicker_and_defense_entries(payload, kicker_export, defense_export)
     print(f"    crosswalk match rate: {crosswalk_report}")
+
+    # Practice Report -- real nflverse injury/practice data for every REG
+    # week of this COMPLETED season (not just the hypothetical stub week).
+    # See src/injury_report.py's module docstring for why this bypasses
+    # assemble_player_advanced_stats entirely.
+    injuries_season = get_injuries([season])
+    payload["practice_report"] = build_practice_report_export(
+        injuries_season, crosswalk, season, get_injuries_source_updated_at(season)
+    )
+    n_practice_weeks = len(payload["practice_report"]["weeks"])
+    print(f"    practice_report: {n_practice_weeks} week(s) of real reports, "
+          f"source_updated_at={payload['practice_report']['source_updated_at']}")
 
     validation_report = validate_export(payload, crosswalk)
     print(f"    validation: {validation_report}")

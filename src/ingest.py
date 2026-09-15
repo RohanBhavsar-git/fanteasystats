@@ -361,6 +361,98 @@ def get_seasonal_rosters(seasons: Iterable[int], refresh: bool = False) -> pd.Da
     return df
 
 
+def get_injuries(seasons: Iterable[int], refresh: bool = False) -> pd.DataFrame:
+    """
+    Weekly injury / practice report -- nflverse's official NFL report, not
+    Sleeper's. One row per (player, team, week): `report_status` is the
+    official game designation (Questionable/Doubtful/Out/Probable, or null
+    when the player isn't on the injury report at all that week);
+    `practice_status` is that week's practice participation (Full/Limited/
+    Did Not Participate/Out); `report_primary_injury`/`practice_primary_
+    injury` name the body part behind each (they're usually the same but
+    occasionally diverge -- e.g. an illness driving the game designation
+    layered on top of a separate, already-tracked physical injury).
+
+    This is WEEKLY data, not day-by-day -- there is no Wednesday/Thursday/
+    Friday breakdown anywhere in this source, at nflreadpy's wrapper level
+    or in the raw nflverse-data release itself (checked directly against
+    both). Don't let a caller reshape `practice_status` into a specific
+    day's practice; it describes the whole week's report.
+
+    There is also no `date_modified`/last-updated column at any level of
+    this source (same direct check) -- see get_injuries_source_updated_at()
+    for the honest substitute: the whole season file's own last-regenerated
+    timestamp, which is real but file-level, not per-row.
+
+    A small number of rows (well under 1% historically) carry a literal
+    "\\n" or the string "Note" in report_status/practice_status -- a real
+    upstream data-quality artifact, not a status this project's schema
+    should propagate. Normalized to null here, once, at the ingestion
+    boundary, so every caller downstream sees only genuine values.
+
+    Uses game_type == 'REG' to scope to real games elsewhere in this
+    pipeline (see e.g. determine_archive_target_week) -- this function
+    returns every game_type nflverse publishes (REG + playoffs); callers
+    filter as needed.
+
+    Returns:
+        DataFrame with gsis_id (string, joins via get_id_crosswalk), season,
+        week, team, position, full_name, report_status,
+        report_primary_injury, report_secondary_injury, practice_status,
+        practice_primary_injury, practice_secondary_injury.
+    """
+    seasons = list(seasons)
+    cache_name = f"injuries_{'_'.join(str(s) for s in seasons)}"
+    if not refresh:
+        cached = _read_cache_parquet(cache_name)
+        if cached is not None:
+            return cached
+    logger.info(f"Fetching injury/practice reports for {seasons}...")
+    df = _to_pandas(_retry_transient(nfl.load_injuries, seasons))
+    df = _normalize_id_column(df, "gsis_id")
+    junk_values = {"\n", "Note", ""}
+    for col in ("report_status", "practice_status", "report_primary_injury",
+                "report_secondary_injury", "practice_primary_injury", "practice_secondary_injury"):
+        if col in df.columns:
+            df[col] = df[col].where(~df[col].isin(junk_values), pd.NA)
+    _write_cache_parquet(df, cache_name)
+    return df
+
+
+def get_injuries_source_updated_at(season: int) -> str | None:
+    """
+    When nflverse's injuries_{season} release file was last regenerated --
+    the honest substitute for a per-row `date_modified`, which does not
+    exist anywhere in this source (see get_injuries' docstring). This is
+    FILE-level freshness ("as of this timestamp, nflverse's whole season
+    snapshot was last touched"), not per-player -- exactly what matters for
+    the one real risk this data has: nflverse runs on its own update
+    schedule and can lag the live, real-world report, most dangerously on a
+    Friday afternoon right before games. Surfacing this beats surfacing
+    nothing, and is honest about being coarser than a per-row timestamp
+    would be.
+
+    Hits the GitHub Releases API directly (nflreadpy exposes no metadata
+    endpoint for this) and returns None -- not a guessed/fabricated
+    timestamp -- on any failure, so a transient network hiccup degrades to
+    "freshness unknown" in the UI rather than aborting a weekly export over
+    a non-essential field.
+    """
+    asset_name = f"injuries_{season}.parquet"
+    try:
+        resp = requests.get(
+            "https://api.github.com/repos/nflverse/nflverse-data/releases/tags/injuries",
+            timeout=15,
+        )
+        resp.raise_for_status()
+        for asset in resp.json().get("assets", []):
+            if asset.get("name") == asset_name:
+                return asset.get("updated_at")
+    except requests.RequestException as e:
+        logger.warning(f"Could not fetch nflverse injuries release metadata: {e}")
+    return None
+
+
 def get_id_crosswalk(refresh: bool = False) -> pd.DataFrame:
     """
     Multi-ID crosswalk — the joiner between nflverse and Sleeper.

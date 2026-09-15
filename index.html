@@ -1591,6 +1591,23 @@
     .injury-badge.O { background: rgba(220, 38, 38, 0.15); color: var(--danger); }
     .injury-badge.IR { background: rgba(220, 38, 38, 0.15); color: var(--danger); }
 
+    /* Practice Report -- same visual language as .injury-badge, its own
+       classes since nflverse's report_status/practice_status values are a
+       different vocabulary than Sleeper's injury_status codes. */
+    .practice-badge {
+      display: inline-block; padding: 1px 6px; border-radius: 3px;
+      font-size: 9px; font-weight: 800; letter-spacing: 0.3px; white-space: nowrap;
+    }
+    .practice-badge.out, .practice-badge.doubtful, .practice-badge.dnp {
+      background: rgba(220, 38, 38, 0.15); color: var(--danger);
+    }
+    .practice-badge.questionable, .practice-badge.limited {
+      background: rgba(217, 119, 6, 0.15); color: var(--warning);
+    }
+    .practice-badge.probable, .practice-badge.full {
+      background: rgba(5, 150, 105, 0.12); color: var(--success);
+    }
+
     .player-detail-hero {
       background: var(--bg-secondary); border: 1px solid var(--border);
       border-radius: 12px; padding: 24px; margin-bottom: 16px; box-shadow: var(--shadow-sm);
@@ -1885,6 +1902,7 @@
         <div class="nav-link" data-view="draft">Draft</div>
         <div class="nav-link" data-view="tendencies">Team Tendencies</div>
         <div class="nav-link" data-view="injuries">Injuries</div>
+        <div class="nav-link" data-view="practice">Practice Report</div>
       </div>
       <div class="league-info" id="league-info">
         <select class="season-selector" id="season-selector" disabled>
@@ -2633,6 +2651,8 @@
     draftPrepFilters: { search: '', position: 'ALL', sortBy: 'seasonPts', sortDir: 'desc' },
     injuryFilter: { status: 'ALL', position: 'ALL', owner: 'ALL' },
     injuryRiskWeek: null,   // which week the lineup-risk panel displays; null = current week
+    practiceReportWeek: null, // which week the Practice Report tab shows; null = latest available
+    practiceReportFilters: { search: '', position: 'ALL', team: 'ALL', rostered: 'ALL', sortBy: 'relevance', sortDir: 'desc' },
     compareFilters: { search: '', position: 'ALL', team: 'ALL', owner: 'ALL', injury: 'ALL', sortBy: 'sleeperProj', sortDir: 'desc' },
     compareWeek: null,    // null = current week; otherwise a specific week to compare projections/stats for
     playerFilters: { search: '', position: 'ALL', team: 'ALL', owner: 'ALL', injury: 'ALL', sortBy: 'sleeperProj', sortDir: 'desc' },
@@ -5615,6 +5635,7 @@
     else if (state.currentView === 'draft') renderDraftView(main);
     else if (state.currentView === 'tendencies') renderTendenciesView(main);
     else if (state.currentView === 'injuries') renderInjuryView(main);
+    else if (state.currentView === 'practice') renderPracticeReportView(main);
 
     if (focusId) {
       const el = document.getElementById(focusId);
@@ -9550,6 +9571,290 @@
     main.querySelectorAll('[data-player-id]').forEach(el => {
       el.addEventListener('click', () => {
         state.activePlayerId = el.dataset.playerId;
+        renderView();
+      });
+    });
+  }
+
+  // ----- PRACTICE REPORT -----
+  // Real nflverse weekly injury/practice data (src/injury_report.py's
+  // `practice_report` export block) -- a DIFFERENT source than the Injury
+  // tab / Lineup Risks panel above, which read Sleeper's own injury_status.
+  // Checked directly against real rostered players in this league before
+  // building this (see notebooks/08_practice_report.ipynb): the two
+  // disagree often and in both directions -- nflverse's official
+  // report_status already showing Questionable/Doubtful/Out while
+  // Sleeper's injury_status still reads healthy (Sleeper hasn't caught up
+  // to this week's report), and the reverse (Sleeper flags Questionable
+  // with no current nflverse report_status). A player Sleeper marks PUP
+  // can still show up here with a real practice_status as they work back.
+  // These are complementary, not redundant, so both columns are shown
+  // side by side rather than collapsed into one "status."
+  //
+  // Also real, not assumed (same notebook): practice participation is
+  // measurably predictive. Across 2018-2025, a "Did Not Participate" week
+  // preceded the player actually playing only ~16% of the time (vs ~84%
+  // for Full Participation); conditional on playing anyway, a Limited week
+  // produced real production/snap-share discounts vs. that player's own
+  // healthy-week baseline. That finding is reported here and in
+  // PROJECT_CONTEXT.md -- it is NOT wired into the projection model.
+  function renderPracticeReportView(main) {
+    const f = state.practiceReportFilters;
+    const pr = state.advancedStats?.practice_report;
+    const weekKeys = pr ? Object.keys(pr.weeks).map(Number).sort((a, b) => a - b) : [];
+
+    if (!pr || weekKeys.length === 0) {
+      main.innerHTML = `
+        <div class="page-header-row"><div><div class="page-title">Practice Report</div></div></div>
+        <div class="panel"><div class="placeholder-content">
+          <h3>📋 Awaiting model output</h3>
+          <p>No real nflverse practice-report data in this export yet.</p>
+        </div></div>
+      `;
+      return;
+    }
+
+    // Default to the most recent real week this export has a report for --
+    // NOT necessarily state.currentWeek, which can be one week AHEAD of the
+    // last week nflverse has actually published a report for.
+    if (state.practiceReportWeek == null || !weekKeys.includes(state.practiceReportWeek)) {
+      state.practiceReportWeek = weekKeys[weekKeys.length - 1];
+    }
+    const week = state.practiceReportWeek;
+    const rawRows = pr.weeks[String(week)] || [];
+
+    const teamOptions = ['ALL', ...NFL_TEAMS].sort();
+
+    // practice_status/report_status are real free-text values, not a fixed
+    // enum this codebase controls (nflverse's own vocabulary) -- these
+    // three helpers are the ONE place that vocabulary gets interpreted,
+    // for severity ranking, a short label, and a CSS-safe class.
+    function practiceRank(status) {
+      if (!status) return 0;
+      if (status.startsWith('Did Not Participate') || status.startsWith('Out')) return 3;
+      if (status.startsWith('Limited')) return 2;
+      if (status.startsWith('Full')) return 1;
+      return 0;
+    }
+    function practiceCode(status) {
+      if (!status) return null;
+      if (status.startsWith('Did Not Participate') || status.startsWith('Out')) return 'dnp';
+      if (status.startsWith('Limited')) return 'limited';
+      if (status.startsWith('Full')) return 'full';
+      return null;
+    }
+    function practiceLabel(status) {
+      if (!status) return null;
+      if (status.startsWith('Did Not Participate')) return 'DNP';
+      if (status.startsWith('Out')) return 'Out';
+      if (status.startsWith('Limited')) return 'Limited';
+      if (status.startsWith('Full')) return 'Full';
+      return status;
+    }
+    const REPORT_RANK = { Out: 4, Doubtful: 3, Questionable: 2, Probable: 1 };
+    function reportRank(status) { return REPORT_RANK[status] || 0; }
+
+    function formatFreshness(iso) {
+      if (!iso) return 'unknown (nflverse metadata fetch failed at export time)';
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return 'unknown';
+      return d.toLocaleString('en-US', {
+        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+      });
+    }
+
+    // Inline 32px avatar -- same pattern as every other table's own
+    // `rowAvatar`, keyed by sleeper_id (nullable here -- not every reported
+    // player has a crosswalk match) rather than state.players, since a
+    // deep-bench/practice-squad player can be real in this report without
+    // ever appearing in the dashboard's own trimmed player list.
+    function rowAvatar(p) {
+      const teamLogo = `https://a.espncdn.com/i/teamlogos/nfl/500/${(p.team || '').toLowerCase()}.png`;
+      if (!p.sleeper_id) {
+        return `<div class="player-row-avatar">${getInitials(p.name)}</div>`;
+      }
+      const headshot = `https://sleepercdn.com/content/nfl/players/thumb/${p.sleeper_id}.jpg`;
+      return `<div class="player-row-avatar">
+        <img src="${headshot}"
+          onerror="this.onerror=null; this.src='${teamLogo}'; this.onerror=function(){this.style.display='none'; this.parentElement.textContent='${getInitials(p.name)}';}"
+          alt="${p.name}">
+      </div>`;
+    }
+
+    // ---- Enrich once per week-load: rostered/owner/Sleeper cross-reference,
+    // independent of search/filter/sort so it doesn't need recomputing on
+    // every keystroke. Rostered status is checked against state.rosters'
+    // OWN player lists (every player_id on a roster, active or not), not
+    // state.playersById (which drops inactive/unrostered non-fantasy-
+    // relevant entries) -- see this function's own rowAvatar comment for
+    // why that trimmed list isn't the right membership test here either.
+    const enriched = rawRows.map(r => {
+      const ownerRoster = r.sleeper_id ? state.rosters.find(ro => (ro.players || []).includes(r.sleeper_id)) : null;
+      const sleeperPlayer = r.sleeper_id ? state.playersById[r.sleeper_id] : null;
+      return {
+        ...r,
+        isRostered: !!ownerRoster,
+        ownerRosterId: ownerRoster ? ownerRoster.roster_id : null,
+        sleeperInjuryStatus: sleeperPlayer ? sleeperPlayer.injuryStatus : null,
+        relevance: (ownerRoster ? 1000 : 0) + reportRank(r.report_status) * 10 + practiceRank(r.practice_status),
+      };
+    });
+
+    main.innerHTML = `
+      <div class="page-header-row">
+        <div>
+          <div class="page-title">Practice Report</div>
+          <div class="page-subtitle" id="practice-subtitle"></div>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <label style="font-size: 12px; color: var(--text-secondary); font-weight: 600;">Week:</label>
+          <select class="filter-select" id="practice-week-select" style="font-size: 12px;">
+            ${weekKeys.map(w => `<option value="${w}"${w === week ? ' selected' : ''}>Week ${w}${w === state.currentWeek ? ' · Current' : ''}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+
+      <div class="info-banner" style="border-left-color: var(--warning); align-items: flex-start; flex-direction: column; gap: 6px;">
+        <div>📋 <strong>This is nflverse's official weekly practice report, not a day-by-day breakdown.</strong>
+        There's no Wednesday/Thursday/Friday split anywhere in this source -- <strong>Practice</strong> is that whole
+        week's participation, and <strong>Report</strong> is the official game designation. Both describe the
+        WEEK, not one specific practice.</div>
+        <div>🕒 <strong>nflverse data as of ${formatFreshness(pr.source_updated_at)}.</strong> nflverse regenerates
+        this file on its own schedule and can lag the real, live report -- most riskily on a Friday afternoon right
+        before games. Don't treat this as more current than that timestamp; check a live source before a
+        time-sensitive lineup call.</div>
+        <div>🔀 <strong>Different source than the Injury tab</strong> (which reads Sleeper's own status). They can
+        disagree in either direction -- shown side by side below so a mismatch is visible, not hidden.</div>
+      </div>
+
+      <div class="filters-bar">
+        <input type="text" class="search-input" id="practice-search" placeholder="Search players..." value="${f.search}" />
+        <select class="filter-select" id="practice-filter-position">
+          <option value="ALL"${f.position === 'ALL' ? ' selected' : ''}>All Positions</option>
+          ${['QB','RB','WR','TE','K'].map(p => `<option value="${p}"${f.position === p ? ' selected' : ''}>${p}</option>`).join('')}
+        </select>
+        <select class="filter-select" id="practice-filter-team">
+          ${teamOptions.map(t => `<option value="${t}"${f.team === t ? ' selected' : ''}>${t === 'ALL' ? 'All NFL Teams' : t}</option>`).join('')}
+        </select>
+        <select class="filter-select" id="practice-filter-rostered">
+          <option value="ALL"${f.rostered === 'ALL' ? ' selected' : ''}>All Players</option>
+          <option value="ROSTERED"${f.rostered === 'ROSTERED' ? ' selected' : ''}>On Rosters</option>
+          <option value="FA"${f.rostered === 'FA' ? ' selected' : ''}>Free Agents</option>
+        </select>
+      </div>
+
+      <div class="panel" style="padding: 0; overflow: hidden;">
+        <table class="players-table">
+          <thead>
+            <tr>
+              <th data-sort="name" class="${f.sortBy === 'name' ? 'sorted' : ''}">Player ${f.sortBy === 'name' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th data-sort="position" class="${f.sortBy === 'position' ? 'sorted' : ''}">Pos ${f.sortBy === 'position' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th data-sort="team" class="${f.sortBy === 'team' ? 'sorted' : ''}">NFL ${f.sortBy === 'team' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th data-sort="practice_status" class="${f.sortBy === 'practice_status' ? 'sorted' : ''}" title="This week's overall practice participation">Practice ${f.sortBy === 'practice_status' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th data-sort="report_status" class="${f.sortBy === 'report_status' ? 'sorted' : ''}" title="Official game designation for this week">Report ${f.sortBy === 'report_status' ? (f.sortDir === 'asc' ? '↑' : '↓') : ''}</th>
+              <th title="practice_primary_injury, with the official report's injury noted below only when it names a different issue">Injury</th>
+              <th title="Sleeper's own injury_status -- the same field driving the Injury tab. Can disagree with nflverse's Report column above.">Sleeper Status</th>
+              <th>Owner</th>
+            </tr>
+          </thead>
+          <tbody id="practice-tbody"></tbody>
+        </table>
+      </div>
+    `;
+
+    function renderTable() {
+      let filtered = enriched;
+      if (f.search) filtered = filtered.filter(p => p.name.toLowerCase().includes(f.search.toLowerCase()));
+      if (f.position !== 'ALL') filtered = filtered.filter(p => p.position === f.position);
+      if (f.team !== 'ALL') filtered = filtered.filter(p => p.team === f.team);
+      if (f.rostered === 'ROSTERED') filtered = filtered.filter(p => p.isRostered);
+      else if (f.rostered === 'FA') filtered = filtered.filter(p => !p.isRostered);
+
+      filtered = filtered.slice().sort((a, b) => {
+        let valA, valB;
+        if (f.sortBy === 'relevance') { valA = a.relevance; valB = b.relevance; }
+        else if (f.sortBy === 'practice_status') { valA = practiceRank(a.practice_status); valB = practiceRank(b.practice_status); }
+        else if (f.sortBy === 'report_status') { valA = reportRank(a.report_status); valB = reportRank(b.report_status); }
+        else { valA = a[f.sortBy]; valB = b[f.sortBy]; }
+        if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = (valB || '').toLowerCase(); }
+        if (valA == null) valA = -Infinity;
+        if (valB == null) valB = -Infinity;
+        if (valA === valB) return a.name.localeCompare(b.name);
+        const cmp = valA < valB ? -1 : 1;
+        return f.sortDir === 'desc' ? -cmp : cmp;
+      });
+
+      document.getElementById('practice-subtitle').textContent =
+        `${filtered.length} of ${enriched.length} players · Week ${week} · sorted by ${f.sortBy === 'relevance' ? 'relevance (rostered + severity)' : f.sortBy.replace('_', ' ')}`;
+
+      document.getElementById('practice-tbody').innerHTML = filtered.map(p => {
+        const practiceCell = p.practice_status
+          ? `<span class="practice-badge ${practiceCode(p.practice_status)}" title="${p.practice_status}">${practiceLabel(p.practice_status)}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        const reportCell = p.report_status
+          ? `<span class="practice-badge ${p.report_status.toLowerCase()}">${p.report_status}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">No designation</span>';
+        const practiceInjury = p.practice_primary_injury || null;
+        const reportInjury = p.report_primary_injury || null;
+        const injuryDiffers = !!(practiceInjury && reportInjury && practiceInjury.toLowerCase() !== reportInjury.toLowerCase());
+        const injuryCell = practiceInjury
+          ? `${practiceInjury}${injuryDiffers ? `<div style="font-size: 10px; color: var(--warning);" title="The official game designation names a different issue than this week's practice report -- worth a second look.">Official report: ${reportInjury}</div>` : ''}`
+          : (reportInjury || '<span style="color: var(--text-muted); font-size: 11px;">—</span>');
+        const sleeperCell = p.sleeperInjuryStatus
+          ? `<span class="injury-badge ${p.sleeperInjuryStatus}">${p.sleeperInjuryStatus}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">Healthy / not tracked</span>';
+        const ownerCell = p.isRostered
+          ? `<span style="font-size: 12px;">${getTeamName(p.ownerRosterId)}</span>`
+          : '<span class="free-agent-pill">Free Agent</span>';
+        return `
+          <tr data-sleeper-id="${p.sleeper_id || ''}">
+            <td><div class="player-row-name">${rowAvatar(p)}<span>${p.name}</span></div></td>
+            <td><span class="pos-badge ${p.position}">${p.position}</span></td>
+            <td>${p.team || '—'}</td>
+            <td>${practiceCell}</td>
+            <td>${reportCell}</td>
+            <td style="font-size: 12px;">${injuryCell}</td>
+            <td>${sleeperCell}</td>
+            <td>${ownerCell}</td>
+          </tr>
+        `;
+      }).join('');
+
+      // Only rows resolving to a real state.playersById entry get a Player
+      // Detail link -- a practice-squad body with no crosswalk/roster
+      // match has nothing to drill into, so it's shown, just not clickable.
+      document.querySelectorAll('#practice-tbody tr[data-sleeper-id]').forEach(el => {
+        const sid = el.dataset.sleeperId;
+        if (sid && state.playersById[sid]) {
+          el.style.cursor = 'pointer';
+          el.addEventListener('click', () => {
+            state.activePlayerId = sid;
+            renderView();
+          });
+        }
+      });
+    }
+
+    renderTable();
+
+    let searchDebounce = null;
+    document.getElementById('practice-search').addEventListener('input', (e) => {
+      f.search = e.target.value;
+      clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(renderTable, 150);
+    });
+    document.getElementById('practice-week-select').addEventListener('change', (e) => {
+      state.practiceReportWeek = parseInt(e.target.value);
+      renderView();
+    });
+    document.getElementById('practice-filter-position').addEventListener('change', (e) => { f.position = e.target.value; renderTable(); });
+    document.getElementById('practice-filter-team').addEventListener('change', (e) => { f.team = e.target.value; renderTable(); });
+    document.getElementById('practice-filter-rostered').addEventListener('change', (e) => { f.rostered = e.target.value; renderTable(); });
+    main.querySelectorAll('th[data-sort]').forEach(th => {
+      th.addEventListener('click', () => {
+        const col = th.dataset.sort;
+        if (f.sortBy === col) f.sortDir = f.sortDir === 'asc' ? 'desc' : 'asc';
+        else { f.sortBy = col; f.sortDir = col === 'name' || col === 'position' || col === 'team' ? 'asc' : 'desc'; }
         renderView();
       });
     });
