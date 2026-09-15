@@ -103,7 +103,7 @@
     }
     .game-status-pill {
       padding: 2px 6px; border-radius: 3px; font-size: 9px;
-      font-weight: 700; letter-spacing: 0.3px;
+      font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; white-space: nowrap;
     }
     .game-status-pill.live { background: var(--live); color: white; }
     .game-status-pill.final { background: var(--text-muted); color: white; }
@@ -567,16 +567,14 @@
     .md-player-injury.Q { background: rgba(217, 119, 6, 0.15); color: var(--warning); }
     .md-player-injury.O { background: rgba(220, 38, 38, 0.15); color: var(--danger); }
     .md-player-injury.IR { background: rgba(220, 38, 38, 0.15); color: var(--danger); }
+    .md-player-score {
+      display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0;
+    }
     .md-player-pts {
-      font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; flex-shrink: 0;
+      font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums;
     }
     .md-player-pts.over { color: var(--success); }
     .md-player-pts.under { color: var(--danger); }
-    .md-player-pts.live::after {
-      content: '●'; color: var(--live); margin-left: 4px;
-      animation: pulse 1.5s ease-in-out infinite;
-    }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
     .md-bench-toggle {
       width: 100%; padding: 10px; background: var(--bg-tertiary);
@@ -2608,6 +2606,10 @@
     selectedSeason: null,    // which SEASON_OPTIONS entry is active -- set by init()/switchSeason()
     league: { name: '', season: '', settings: {} }, users: [], rosters: [],
     weeklyMatchups: {}, activityByWeek: {}, nflGames: [],
+    liveNflGames: [],       // stable snapshot of the live season's ACTUAL current-week ESPN games --
+                             // unlike nflGames, never reassigned by the sidebar's own week-browsing
+                             // dropdown, so the matchup detail's per-player game-status indicator
+                             // always reflects "right now," not whatever week the sidebar is browsing.
     winnersBracket: [], losersBracket: [],
     draft: null, draftPicks: [], draftTradedPicks: [],
     blowout: null, champions: [], players: [],
@@ -2735,21 +2737,27 @@
   }
 
   // Whichever season has real data, checked explicitly rather than assumed
-  // -- this is the ONE place "does the live season have real games yet"
+  // -- this is the ONE place "does the live season have real data yet"
   // still gets checked, now to pick an honest DEFAULT selection rather
   // than to silently swap which league's data loads. Falls back to the
   // most recent archive (SEASON_OPTIONS' first non-live entry) when the
-  // live season has no real games yet; falls back to the live season
-  // itself if even the rosters fetch fails, so init() always has SOME
-  // season to try next rather than never starting.
+  // live league hasn't started yet; falls back to the live season itself
+  // if even the league fetch fails, so init() always has SOME season to
+  // try next rather than never starting.
+  //
+  // Checks the league's own `status` field (pre_draft/drafting/in_season/
+  // complete), not roster win/loss totals -- those only populate once a
+  // week is fully scored, which used to mean a genuinely in-progress live
+  // season (real draft, real rosters, real games kicked off) still lost
+  // the default to last year's archive for the entire first week, simply
+  // because no matchup had been settled yet.
   async function determineDefaultSeason() {
     const live = SEASON_OPTIONS.find(s => s.live);
     try {
-      const rosters = await fetchJSON(`${API}/league/${live.leagueId}/rosters`);
-      const hasGames = rosters.some(r =>
-        (r.settings?.wins || 0) + (r.settings?.losses || 0) + (r.settings?.ties || 0) > 0
-      );
-      if (hasGames) return live.season;
+      const league = await fetchJSON(`${API}/league/${live.leagueId}`);
+      if (league.status && league.status !== 'pre_draft' && league.status !== 'drafting') {
+        return live.season;
+      }
     } catch (e) {
       console.warn('Could not check live season status, defaulting to the most recent archive:', e);
     }
@@ -3065,6 +3073,12 @@
       draftPicks: draftPicks || [],
       draftTradedPicks: draftTradedPicks || [],
       nflGames,
+      // A stable copy of the same fetch, kept separate from nflGames so the
+      // matchup detail's per-player game-status indicator (below) always
+      // reflects the real current week even after the sidebar's own week-
+      // browsing dropdown (renderSidebar) reassigns state.nflGames to some
+      // other week the user is idly looking at.
+      liveNflGames: nflGames,
       nflWeekInfo,
       blowout: blowout || null,
       champions: [],
@@ -5339,6 +5353,35 @@
     return state.currentWeek || 0;
   }
 
+  // Real per-player game status for one fantasy week: 'upcoming' (kickoff
+  // hasn't happened, score can only go up from here), 'live' (game is
+  // being played right now, score can still change), or 'final' (game is
+  // over, score is locked). This is what the matchup detail's score
+  // indicator reads -- replacing a blinking dot that only ever meant
+  // "this week is the current week and this slot has scored something,"
+  // which couldn't tell a player whose game just ended apart from one who
+  // hasn't kicked off yet, and read as an alert/error rather than status.
+  //
+  // A week strictly before/after the league's current leg is unambiguous
+  // without needing any live data (history is locked, the future hasn't
+  // happened). Only the current week needs state.liveNflGames -- which
+  // stays empty for an archived season (see fetchAllRealData's Step 5), so
+  // an archive's own final week correctly falls through to 'final' rather
+  // than claiming to be live. A team with no matching game this week (bye,
+  // or a fetch failure) also falls through to 'final': there's nothing left
+  // to happen for that slot, so "locked" is the honest, safe default.
+  function getPlayerGameStatus(player, week) {
+    if (!player) return null;
+    const cw = getCurrentWeek();
+    if (week > cw) return 'upcoming';
+    if (week < cw) return 'final';
+    const game = state.liveNflGames?.find(g => g.home?.abbr === player.team || g.away?.abbr === player.team);
+    if (!game) return 'final';
+    if (game.status === 'pre') return 'upcoming';
+    if (game.status === 'final') return 'final';
+    return 'live';
+  }
+
   function getRoster(id) { return state.rosters.find(r => r.roster_id === id); }
   function getOwner(rosterId) {
     const r = getRoster(rosterId);
@@ -5541,20 +5584,45 @@
 
   // ----- Main render router -----
   function renderView() {
-    destroyCharts();
+    // Preserve focus + cursor/selection position across the rebuild below.
+    // The search boxes (Players/Comparison/Draft Prep) already avoid
+    // calling this on every keystroke -- see renderTbody/
+    // renderAddPlayersTable/renderPrepRows -- but a few lazy background
+    // fetches (e.g. Player Comparison's per-week stats, which feed its
+    // shelf cards and charts, not just its search table) still trigger a
+    // full renderView() when they resolve. Without this, one of those
+    // resolving mid-keystroke would recreate the focused <input> and drop
+    // focus outright -- or, if refocused naively, land the caret back at
+    // index 0, the exact bug those search boxes used to have.
     const main = document.getElementById('main-content');
-    if (state.activeNflGameId) return renderGamecast(main);
-    if (state.activeMatchupId !== null) return renderMatchupDetail(main);
-    if (state.activeTeamId !== null) return renderTeamDetail(main);
-    if (state.activePlayerId !== null) return renderPlayerDetail(main);
-    if (state.currentView === 'dashboard') return renderDashboard(main);
-    if (state.currentView === 'matchups') return renderMatchupsView(main);
-    if (state.currentView === 'teams') return renderTeamsView(main);
-    if (state.currentView === 'players') return renderPlayersView(main);
-    if (state.currentView === 'comparison') return renderComparisonView(main);
-    if (state.currentView === 'draft') return renderDraftView(main);
-    if (state.currentView === 'tendencies') return renderTendenciesView(main);
-    if (state.currentView === 'injuries') return renderInjuryView(main);
+    const active = document.activeElement;
+    const isRestorableInput = active && main.contains(active) && active.id &&
+      (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
+    const focusId = isRestorableInput ? active.id : null;
+    const selStart = isRestorableInput ? active.selectionStart : null;
+    const selEnd = isRestorableInput ? active.selectionEnd : null;
+
+    destroyCharts();
+    if (state.activeNflGameId) renderGamecast(main);
+    else if (state.activeMatchupId !== null) renderMatchupDetail(main);
+    else if (state.activeTeamId !== null) renderTeamDetail(main);
+    else if (state.activePlayerId !== null) renderPlayerDetail(main);
+    else if (state.currentView === 'dashboard') renderDashboard(main);
+    else if (state.currentView === 'matchups') renderMatchupsView(main);
+    else if (state.currentView === 'teams') renderTeamsView(main);
+    else if (state.currentView === 'players') renderPlayersView(main);
+    else if (state.currentView === 'comparison') renderComparisonView(main);
+    else if (state.currentView === 'draft') renderDraftView(main);
+    else if (state.currentView === 'tendencies') renderTendenciesView(main);
+    else if (state.currentView === 'injuries') renderInjuryView(main);
+
+    if (focusId) {
+      const el = document.getElementById(focusId);
+      if (el) {
+        el.focus();
+        if (typeof el.setSelectionRange === 'function') el.setSelectionRange(selStart, selEnd);
+      }
+    }
   }
 
   // ----- DASHBOARD -----
@@ -5954,13 +6022,23 @@
       ? [...allBench].sort((a, b) => b.weekPts - a.weekPts)[0]
       : null;
 
+    // Maps getPlayerGameStatus's semantic status to the existing
+    // game-status-pill classes/copy the sidebar's NFL scoreboard already
+    // uses (see renderSidebar's nfl-game cards) -- same visual language,
+    // not a new one, just applied per-player instead of per-game.
+    const GAME_STATUS_PILL = {
+      upcoming: { cls: 'pre', label: 'Not Started' },
+      live: { cls: 'live', label: 'Live' },
+      final: { cls: 'final', label: 'Final' },
+    };
     function renderPlayerCell(slot, isRight) {
       const p = slot.player;
       if (!p) return `<div class="md-player ${isRight ? 'right' : ''}"><div class="md-player-info"><div class="md-player-name">--</div></div></div>`;
-      const isLive = state.selectedWeek === getCurrentWeek();
       const injHtml = p.injuryStatus ? `<span class="md-player-injury ${p.injuryStatus}">${p.injuryStatus}</span>` : '';
       const statLine = getStatLine(p, weekStats);
       const isDnp = statLine === 'DNP';
+      const gameStatus = GAME_STATUS_PILL[getPlayerGameStatus(p, state.selectedWeek)];
+      const gameStatusPill = gameStatus ? `<span class="game-status-pill ${gameStatus.cls}">${gameStatus.label}</span>` : '';
       return `
         <div class="md-player ${isRight ? 'right' : ''}" data-player-id="${p.player_id}">
           ${playerAvatarHtml(p)}
@@ -5969,7 +6047,10 @@
             <div class="md-player-meta"><span class="pos-pill pos-${p.position}">${p.position}</span>${p.team || ''}</div>
             ${statLine ? `<div class="md-player-statline ${isDnp ? 'dnp' : ''}">${statLine}</div>` : ''}
           </div>
-          <div class="md-player-pts ${isLive && slot.weekPts > 0 ? 'live' : ''}">${slot.weekPts.toFixed(1)}</div>
+          <div class="md-player-score">
+            <div class="md-player-pts">${slot.weekPts.toFixed(1)}</div>
+            ${gameStatusPill}
+          </div>
         </div>
       `;
     }
@@ -6349,76 +6430,24 @@
     const season = state.league?.season;
     const availableWeeks = getAvailableWeeks();
 
-    // Lazy-fetch projections for the selected week. View re-renders when data arrives.
+    // Lazy-fetch projections for the selected week. Repaints only the table
+    // body (renderTbody, defined below) rather than the whole view once
+    // data arrives -- a full renderView() here would recreate the search
+    // input out from under anyone typing into it the moment this resolves,
+    // the same destroy-the-focused-input problem renderTbody exists to
+    // avoid. Guarded so a slow, late-resolving fetch for a week/view the
+    // user has since navigated away from doesn't paint stale data over
+    // whatever's now on screen -- state.playerWeek may have changed, or
+    // main-content may not even be the Players view anymore.
     if (season && playerWeek) {
       if (!state.projectionsByWeek?.[playerWeek] && !state.projectionsFetching?.has(playerWeek)) {
-        fetchWeekProjections(season, playerWeek).then(() => renderView());
+        fetchWeekProjections(season, playerWeek).then(() => {
+          if (state.currentView === 'players' && (state.playerWeek || state.currentWeek || 0) === playerWeek) {
+            renderTbody();
+          }
+        });
       }
     }
-    const projData = state.projectionsByWeek?.[playerWeek] || {};
-
-    // Filter list — built off real Sleeper data only
-    let filtered = [...state.players];
-    if (f.search) filtered = filtered.filter(p => p.name.toLowerCase().includes(f.search.toLowerCase()));
-    if (f.position !== 'ALL') filtered = filtered.filter(p => p.position === f.position);
-    if (f.team !== 'ALL') filtered = filtered.filter(p => p.team === f.team);
-    if (f.owner === 'FA') filtered = filtered.filter(p => p.ownerRosterId === null);
-    else if (f.owner === 'ROSTERED') filtered = filtered.filter(p => p.ownerRosterId !== null);
-    else if (f.owner !== 'ALL') filtered = filtered.filter(p => p.ownerRosterId === parseInt(f.owner));
-    if (f.injury !== 'ALL') {
-      if (f.injury === 'Healthy') filtered = filtered.filter(p => !p.injuryStatus);
-      else filtered = filtered.filter(p => p.injuryStatus === f.injury);
-    }
-
-    // Attach projected points to each filtered player for sorting/display.
-    // resolvePts applies the league's custom scoring rules to the raw stat
-    // line embedded in Sleeper's projection, so this respects bonuses, TE
-    // premium, 4-vs-6 pt pass TDs, etc.
-    filtered.forEach(p => {
-      const proj = projData[p.player_id];
-      p.sleeperProj = resolvePts(proj, state.league, p.position);
-      const myProj = getMyProj(p.player_id, season, playerWeek);
-      p.myProj = myProj?.point ?? null;
-      p.myProjFloor = myProj?.floor ?? null;
-      p.myProjCeiling = myProj?.ceiling ?? null;
-
-      // Trend/FP Over Exp/Volatility are SEASON-level signals from the
-      // export, not tied to the selected proj week -- read unconditionally,
-      // same as the Dashboard's Usage Trending/xFP Regression panels
-      // (see their own comments for why no getMyProj-style week gate
-      // applies here). fp_over_expected/xfp_vol now populate for QB too
-      // (src/usage.py::add_xfp_features gained a QB dropback + designed-
-      // rush bucket model -- see PROJECT_CONTEXT.md's QB xFP findings);
-      // no position check is needed here either way -- null only means
-      // "not enough bucket history yet", not "wrong position".
-      const advanced = getAdvancedPlayer(p.player_id);
-      const trendHeadline = getPlayerTrendHeadline(advanced?.trend);
-      p.trendSignal = trendHeadline?.signal ?? null;
-      p.trendDirection = trendHeadline?.direction ?? null;
-      p.trendFeature = trendHeadline?.feature ?? null;
-      p.fpOverExp = advanced?.xfp?.fp_over_expected ?? null;
-      p.volatility = advanced?.usage?.xfp_vol ?? null;
-
-      // Matchup IS tied to the selected proj week (opponent changes every
-      // week), unlike the season-level signals just above -- getMatchup
-      // returns null outright unless playerWeek matches the export's own
-      // meta.week, same gating getMyProj already applies for p.myProj.
-      const matchup = getMatchup(p.player_id, season, playerWeek);
-      p.matchupRank = matchup?.rank ?? null;
-      p.matchupPoolSize = matchup?.pool_size ?? null;
-    });
-
-    // Sort
-    filtered.sort((a, b) => {
-      let valA = a[f.sortBy], valB = b[f.sortBy];
-      // Nulls sort to the bottom regardless of direction
-      if (valA == null && valB == null) return 0;
-      if (valA == null) return 1;
-      if (valB == null) return -1;
-      if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = valB.toLowerCase(); }
-      if (f.sortDir === 'desc') return valA > valB ? -1 : valA < valB ? 1 : 0;
-      return valA < valB ? -1 : valA > valB ? 1 : 0;
-    });
 
     // FP Over Exp reads xfp.fp_over_expected, which describes meta.xfp_season
     // -- not necessarily the displayed season. A pre-draft/off-season weekly
@@ -6462,7 +6491,7 @@
       <div class="page-header-row">
         <div>
           <div class="page-title">Players</div>
-          <div class="page-subtitle">${filtered.length} of ${state.players.length} players · Click any row for details</div>
+          <div class="page-subtitle" id="players-subtitle"></div>
         </div>
         <div style="display: flex; gap: 8px; align-items: center;">
           <label style="font-size: 12px; color: var(--text-secondary); font-weight: 600;">Proj Week:</label>
@@ -6549,77 +6578,173 @@
               <th>Status</th>
             </tr>
           </thead>
-          <tbody>
-            ${filtered.slice(0, 100).map(p => {
-              const isFA = !p.ownerRosterId;
-              const sleeperProjCell = p.sleeperProj != null
-                ? `<span style="font-weight: 700;">${p.sleeperProj.toFixed(1)}</span>`
-                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
-              const myProjCell = p.myProj != null
-                ? `<span style="font-weight: 700; color: var(--accent);">${p.myProj.toFixed(1)}</span>` +
-                  (p.myProjFloor != null && p.myProjCeiling != null
-                    ? `<div style="font-size: 10px; color: var(--text-muted);">${p.myProjFloor.toFixed(1)}–${p.myProjCeiling.toFixed(1)}</div>`
-                    : '')
-                : '<span style="color: var(--text-muted); font-size: 11px;" title="Custom model not loaded">—</span>';
-              const trendCell = p.trendDirection
-                ? `<span style="color: ${p.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${p.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[p.trendFeature]}</span>`
-                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
-              // QB's fp_over_expected strips out meaningfully less luck than
-              // RB/WR/TE's does (split-half check: 0.37 vs. 0.19 residual
-              // correlation -- see PROJECT_CONTEXT.md's QB xFP findings), so
-              // a QB cell gets its own title rather than sharing the column
-              // header's tooltip -- a big QB number shouldn't read with the
-              // same "this is mostly luck" confidence as the same number
-              // for a receiver.
-              const fpOverExpCellTitle = p.position === 'QB'
-                ? 'For QB, this reflects real accuracy/decision-making more than luck -- a large number here is less certainly luck than the same number for RB/WR/TE.'
-                : '';
-              const fpOverExpCell = p.fpOverExp != null
-                ? `<span style="font-weight: 700; color: ${p.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};"${fpOverExpCellTitle ? ` title="${fpOverExpCellTitle}"` : ''}>${p.fpOverExp > 0 ? '+' : ''}${p.fpOverExp.toFixed(1)}</span>`
-                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
-              const volatilityCell = p.volatility != null
-                ? `<span style="font-weight: 700;">${p.volatility.toFixed(1)}</span>`
-                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
-              return `
-                <tr data-player-id="${p.player_id}">
-                  <td>
-                    <div class="player-row-name">
-                      ${rowAvatar(p)}
-                      <span>${p.name}</span>
-                    </div>
-                  </td>
-                  <td><span class="pos-badge ${p.position}">${p.position}</span></td>
-                  <td>${p.team || 'FA'}</td>
-                  <td>${matchupIndicatorHtml(p.player_id, season, playerWeek)}</td>
-                  <td style="font-size: 12px;">${isFA ? '<span class="free-agent-pill">Free Agent</span>' : getTeamName(p.ownerRosterId)}</td>
-                  <td class="right">${sleeperProjCell}</td>
-                  <td class="right">${myProjCell}</td>
-                  <td class="right">${trendCell}</td>
-                  <td class="right">${fpOverExpCell}</td>
-                  <td class="right">${volatilityCell}</td>
-                  <td>${p.injuryStatus ? `<span class="injury-badge ${p.injuryStatus}">${p.injuryStatus}</span>` : '<span style="color: var(--success); font-size: 11px; font-weight: 600;">●  Healthy</span>'}</td>
-                </tr>
-              `;
-            }).join('')}
-          </tbody>
+          <tbody id="players-tbody"></tbody>
         </table>
-        ${filtered.length > 100 ? `<div style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--border);">Showing first 100 of ${filtered.length} players · refine filters to see more</div>` : ''}
+        <div id="players-table-footer"></div>
       </div>
     `;
 
+    // Recomputes the filtered/sorted list and repaints only the table body,
+    // subtitle count, and footer -- never the search input or filter
+    // controls. This is what the search box's debounced 'input' listener
+    // calls instead of a full renderView(): rebuilding the whole view (and
+    // therefore recreating the <input> element) on every keystroke was the
+    // cause of a real bug where typing came out reversed -- the freshly
+    // created input got focus() restored but not cursor position, so the
+    // caret always landed back at index 0.
+    function renderTbody() {
+      // Read fresh every call (not captured once at the top of
+      // renderPlayersView) so that when the lazy projections fetch above
+      // resolves and calls renderTbody() directly instead of a full
+      // renderView(), the newly-cached data actually shows up.
+      const projData = state.projectionsByWeek?.[playerWeek] || {};
+
+      // Filter list — built off real Sleeper data only
+      let filtered = [...state.players];
+      if (f.search) filtered = filtered.filter(p => p.name.toLowerCase().includes(f.search.toLowerCase()));
+      if (f.position !== 'ALL') filtered = filtered.filter(p => p.position === f.position);
+      if (f.team !== 'ALL') filtered = filtered.filter(p => p.team === f.team);
+      if (f.owner === 'FA') filtered = filtered.filter(p => p.ownerRosterId === null);
+      else if (f.owner === 'ROSTERED') filtered = filtered.filter(p => p.ownerRosterId !== null);
+      else if (f.owner !== 'ALL') filtered = filtered.filter(p => p.ownerRosterId === parseInt(f.owner));
+      if (f.injury !== 'ALL') {
+        if (f.injury === 'Healthy') filtered = filtered.filter(p => !p.injuryStatus);
+        else filtered = filtered.filter(p => p.injuryStatus === f.injury);
+      }
+
+      // Attach projected points to each filtered player for sorting/display.
+      // resolvePts applies the league's custom scoring rules to the raw stat
+      // line embedded in Sleeper's projection, so this respects bonuses, TE
+      // premium, 4-vs-6 pt pass TDs, etc.
+      filtered.forEach(p => {
+        const proj = projData[p.player_id];
+        p.sleeperProj = resolvePts(proj, state.league, p.position);
+        const myProj = getMyProj(p.player_id, season, playerWeek);
+        p.myProj = myProj?.point ?? null;
+        p.myProjFloor = myProj?.floor ?? null;
+        p.myProjCeiling = myProj?.ceiling ?? null;
+
+        // Trend/FP Over Exp/Volatility are SEASON-level signals from the
+        // export, not tied to the selected proj week -- read unconditionally,
+        // same as the Dashboard's Usage Trending/xFP Regression panels
+        // (see their own comments for why no getMyProj-style week gate
+        // applies here). fp_over_expected/xfp_vol now populate for QB too
+        // (src/usage.py::add_xfp_features gained a QB dropback + designed-
+        // rush bucket model -- see PROJECT_CONTEXT.md's QB xFP findings);
+        // no position check is needed here either way -- null only means
+        // "not enough bucket history yet", not "wrong position".
+        const advanced = getAdvancedPlayer(p.player_id);
+        const trendHeadline = getPlayerTrendHeadline(advanced?.trend);
+        p.trendSignal = trendHeadline?.signal ?? null;
+        p.trendDirection = trendHeadline?.direction ?? null;
+        p.trendFeature = trendHeadline?.feature ?? null;
+        p.fpOverExp = advanced?.xfp?.fp_over_expected ?? null;
+        p.volatility = advanced?.usage?.xfp_vol ?? null;
+
+        // Matchup IS tied to the selected proj week (opponent changes every
+        // week), unlike the season-level signals just above -- getMatchup
+        // returns null outright unless playerWeek matches the export's own
+        // meta.week, same gating getMyProj already applies for p.myProj.
+        const matchup = getMatchup(p.player_id, season, playerWeek);
+        p.matchupRank = matchup?.rank ?? null;
+        p.matchupPoolSize = matchup?.pool_size ?? null;
+      });
+
+      // Sort
+      filtered.sort((a, b) => {
+        let valA = a[f.sortBy], valB = b[f.sortBy];
+        // Nulls sort to the bottom regardless of direction
+        if (valA == null && valB == null) return 0;
+        if (valA == null) return 1;
+        if (valB == null) return -1;
+        if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = valB.toLowerCase(); }
+        if (f.sortDir === 'desc') return valA > valB ? -1 : valA < valB ? 1 : 0;
+        return valA < valB ? -1 : valA > valB ? 1 : 0;
+      });
+
+      document.getElementById('players-subtitle').textContent =
+        `${filtered.length} of ${state.players.length} players · Click any row for details`;
+
+      document.getElementById('players-tbody').innerHTML = filtered.slice(0, 100).map(p => {
+        const isFA = !p.ownerRosterId;
+        const sleeperProjCell = p.sleeperProj != null
+          ? `<span style="font-weight: 700;">${p.sleeperProj.toFixed(1)}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        const myProjCell = p.myProj != null
+          ? `<span style="font-weight: 700; color: var(--accent);">${p.myProj.toFixed(1)}</span>` +
+            (p.myProjFloor != null && p.myProjCeiling != null
+              ? `<div style="font-size: 10px; color: var(--text-muted);">${p.myProjFloor.toFixed(1)}–${p.myProjCeiling.toFixed(1)}</div>`
+              : '')
+          : '<span style="color: var(--text-muted); font-size: 11px;" title="Custom model not loaded">—</span>';
+        const trendCell = p.trendDirection
+          ? `<span style="color: ${p.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${p.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[p.trendFeature]}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        // QB's fp_over_expected strips out meaningfully less luck than
+        // RB/WR/TE's does (split-half check: 0.37 vs. 0.19 residual
+        // correlation -- see PROJECT_CONTEXT.md's QB xFP findings), so
+        // a QB cell gets its own title rather than sharing the column
+        // header's tooltip -- a big QB number shouldn't read with the
+        // same "this is mostly luck" confidence as the same number
+        // for a receiver.
+        const fpOverExpCellTitle = p.position === 'QB'
+          ? 'For QB, this reflects real accuracy/decision-making more than luck -- a large number here is less certainly luck than the same number for RB/WR/TE.'
+          : '';
+        const fpOverExpCell = p.fpOverExp != null
+          ? `<span style="font-weight: 700; color: ${p.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};"${fpOverExpCellTitle ? ` title="${fpOverExpCellTitle}"` : ''}>${p.fpOverExp > 0 ? '+' : ''}${p.fpOverExp.toFixed(1)}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        const volatilityCell = p.volatility != null
+          ? `<span style="font-weight: 700;">${p.volatility.toFixed(1)}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        return `
+          <tr data-player-id="${p.player_id}">
+            <td>
+              <div class="player-row-name">
+                ${rowAvatar(p)}
+                <span>${p.name}</span>
+              </div>
+            </td>
+            <td><span class="pos-badge ${p.position}">${p.position}</span></td>
+            <td>${p.team || 'FA'}</td>
+            <td>${matchupIndicatorHtml(p.player_id, season, playerWeek)}</td>
+            <td style="font-size: 12px;">${isFA ? '<span class="free-agent-pill">Free Agent</span>' : getTeamName(p.ownerRosterId)}</td>
+            <td class="right">${sleeperProjCell}</td>
+            <td class="right">${myProjCell}</td>
+            <td class="right">${trendCell}</td>
+            <td class="right">${fpOverExpCell}</td>
+            <td class="right">${volatilityCell}</td>
+            <td>${p.injuryStatus ? `<span class="injury-badge ${p.injuryStatus}">${p.injuryStatus}</span>` : '<span style="color: var(--success); font-size: 11px; font-weight: 600;">●  Healthy</span>'}</td>
+          </tr>
+        `;
+      }).join('');
+
+      document.getElementById('players-table-footer').innerHTML = filtered.length > 100
+        ? `<div style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--border);">Showing first 100 of ${filtered.length} players · refine filters to see more</div>`
+        : '';
+
+      main.querySelectorAll('tr[data-player-id]').forEach(el => {
+        el.addEventListener('click', () => {
+          state.activePlayerId = el.dataset.playerId;
+          renderView();
+        });
+      });
+    }
+
+    renderTbody();
+
+    let searchDebounce = null;
     document.getElementById('search-input').addEventListener('input', (e) => {
       state.playerFilters.search = e.target.value;
-      renderView();
-      setTimeout(() => document.getElementById('search-input')?.focus(), 0);
+      clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(renderTbody, 150);
     });
     document.getElementById('players-week-select')?.addEventListener('change', (e) => {
       state.playerWeek = parseInt(e.target.value);
       renderView();
     });
-    document.getElementById('filter-position').addEventListener('change', (e) => { state.playerFilters.position = e.target.value; renderView(); });
-    document.getElementById('filter-team').addEventListener('change', (e) => { state.playerFilters.team = e.target.value; renderView(); });
-    document.getElementById('filter-owner').addEventListener('change', (e) => { state.playerFilters.owner = e.target.value; renderView(); });
-    document.getElementById('filter-injury').addEventListener('change', (e) => { state.playerFilters.injury = e.target.value; renderView(); });
+    document.getElementById('filter-position').addEventListener('change', (e) => { state.playerFilters.position = e.target.value; renderTbody(); });
+    document.getElementById('filter-team').addEventListener('change', (e) => { state.playerFilters.team = e.target.value; renderTbody(); });
+    document.getElementById('filter-owner').addEventListener('change', (e) => { state.playerFilters.owner = e.target.value; renderTbody(); });
+    document.getElementById('filter-injury').addEventListener('change', (e) => { state.playerFilters.injury = e.target.value; renderTbody(); });
     main.querySelectorAll('th[data-sort]').forEach(th => {
       th.addEventListener('click', () => {
         const col = th.dataset.sort;
@@ -6629,12 +6754,6 @@
           state.playerFilters.sortBy = col;
           state.playerFilters.sortDir = 'desc';
         }
-        renderView();
-      });
-    });
-    main.querySelectorAll('tr[data-player-id]').forEach(el => {
-      el.addEventListener('click', () => {
-        state.activePlayerId = el.dataset.playerId;
         renderView();
       });
     });
@@ -7161,38 +7280,6 @@
     const playerStats = {};
     compared.forEach(p => { playerStats[p.player_id] = computePlayerStats(p); });
 
-    // ---- Filtered list for the Add Players panel ----
-    let filtered = [...state.players];
-    if (f.search) filtered = filtered.filter(p => p.name.toLowerCase().includes(f.search.toLowerCase()));
-    if (f.position !== 'ALL') filtered = filtered.filter(p => p.position === f.position);
-    if (f.team !== 'ALL') filtered = filtered.filter(p => p.team === f.team);
-    if (f.owner === 'FA') filtered = filtered.filter(p => p.ownerRosterId === null);
-    else if (f.owner === 'ROSTERED') filtered = filtered.filter(p => p.ownerRosterId !== null);
-    else if (f.owner !== 'ALL') filtered = filtered.filter(p => p.ownerRosterId === parseInt(f.owner));
-    if (f.injury !== 'ALL') {
-      if (f.injury === 'Healthy') filtered = filtered.filter(p => !p.injuryStatus);
-      else filtered = filtered.filter(p => p.injuryStatus === f.injury);
-    }
-
-    // Attach proj for filter table sorting (custom-scored)
-    const projData = state.projectionsByWeek?.[compareWeek] || {};
-    filtered.forEach(p => {
-      p.sleeperProj = resolvePts(projData[p.player_id], state.league, p.position);
-      const myProj = getMyProj(p.player_id, season, compareWeek);
-      p.myProj = myProj?.point ?? null;
-      p.myProjFloor = myProj?.floor ?? null;
-      p.myProjCeiling = myProj?.ceiling ?? null;
-    });
-    filtered.sort((a, b) => {
-      let valA = a[f.sortBy], valB = b[f.sortBy];
-      if (valA == null && valB == null) return 0;
-      if (valA == null) return 1;
-      if (valB == null) return -1;
-      if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = valB.toLowerCase(); }
-      if (f.sortDir === 'desc') return valA > valB ? -1 : valA < valB ? 1 : 0;
-      return valA < valB ? -1 : valA > valB ? 1 : 0;
-    });
-
     const teamOptions = ['ALL', ...NFL_TEAMS].sort();
     const positions = [...new Set(compared.map(p => p.position))];
     const mixedPositions = positions.length > 1;
@@ -7585,46 +7672,105 @@
               <th>Action</th>
             </tr>
           </thead>
-          <tbody>
-            ${filtered.slice(0, 50).map(p => {
-              const isFA = !p.ownerRosterId;
-              const added = isCompared(p.player_id);
-              const full = state.compareIds.length >= MAX_COMPARE;
-              const sleeperProjCell = p.sleeperProj != null
-                ? `<span style="font-weight: 700;">${p.sleeperProj.toFixed(1)}</span>`
-                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
-              const myProjCell = p.myProj != null
-                ? `<span style="font-weight: 700; color: var(--accent);">${p.myProj.toFixed(1)}</span>` +
-                  (p.myProjFloor != null && p.myProjCeiling != null
-                    ? `<div style="font-size: 10px; color: var(--text-muted);">${p.myProjFloor.toFixed(1)}–${p.myProjCeiling.toFixed(1)}</div>`
-                    : '')
-                : '<span style="color: var(--text-muted); font-size: 11px;" title="Custom model not loaded">—</span>';
-              return `
-                <tr>
-                  <td>
-                    <div class="player-row-name">
-                      ${rowAvatar(p)}
-                      <span style="cursor: pointer;" data-view-player="${p.player_id}">${p.name}</span>
-                    </div>
-                  </td>
-                  <td><span class="pos-badge ${p.position}">${p.position}</span></td>
-                  <td>${p.team || 'FA'}</td>
-                  <td style="font-size: 12px;">${isFA ? '<span class="free-agent-pill">FA</span>' : getTeamName(p.ownerRosterId)}</td>
-                  <td class="right">${sleeperProjCell}</td>
-                  <td class="right">${myProjCell}</td>
-                  <td>
-                    <button class="add-mini-btn ${added ? 'added' : ''}" data-add-id="${p.player_id}" ${added || (full && !added) ? 'disabled' : ''}>
-                      ${added ? '✓ Added' : full ? 'Full' : '+ Add'}
-                    </button>
-                  </td>
-                </tr>
-              `;
-            }).join('')}
-          </tbody>
+          <tbody id="cmp-tbody"></tbody>
         </table>
-        ${filtered.length > 50 ? `<div style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--border);">Showing first 50 of ${filtered.length} · refine filters to see more</div>` : ''}
+        <div id="cmp-table-footer"></div>
       </div>
     `;
+
+    // Recomputes the filtered/sorted Add-Players list and repaints only
+    // that table's body + footer -- never the search input or filter
+    // controls above it. Mirrors renderPlayersView's renderTbody(): the
+    // search box used to call the full renderView() on every keystroke,
+    // which recreated the <input> and made typing come out reversed
+    // (focus() restores focus but not cursor position, so the caret kept
+    // landing back at index 0).
+    function renderAddPlayersTable() {
+      let filtered = [...state.players];
+      if (f.search) filtered = filtered.filter(p => p.name.toLowerCase().includes(f.search.toLowerCase()));
+      if (f.position !== 'ALL') filtered = filtered.filter(p => p.position === f.position);
+      if (f.team !== 'ALL') filtered = filtered.filter(p => p.team === f.team);
+      if (f.owner === 'FA') filtered = filtered.filter(p => p.ownerRosterId === null);
+      else if (f.owner === 'ROSTERED') filtered = filtered.filter(p => p.ownerRosterId !== null);
+      else if (f.owner !== 'ALL') filtered = filtered.filter(p => p.ownerRosterId === parseInt(f.owner));
+      if (f.injury !== 'ALL') {
+        if (f.injury === 'Healthy') filtered = filtered.filter(p => !p.injuryStatus);
+        else filtered = filtered.filter(p => p.injuryStatus === f.injury);
+      }
+
+      // Attach proj for filter table sorting (custom-scored)
+      const projData = state.projectionsByWeek?.[compareWeek] || {};
+      filtered.forEach(p => {
+        p.sleeperProj = resolvePts(projData[p.player_id], state.league, p.position);
+        const myProj = getMyProj(p.player_id, season, compareWeek);
+        p.myProj = myProj?.point ?? null;
+        p.myProjFloor = myProj?.floor ?? null;
+        p.myProjCeiling = myProj?.ceiling ?? null;
+      });
+      filtered.sort((a, b) => {
+        let valA = a[f.sortBy], valB = b[f.sortBy];
+        if (valA == null && valB == null) return 0;
+        if (valA == null) return 1;
+        if (valB == null) return -1;
+        if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = valB.toLowerCase(); }
+        if (f.sortDir === 'desc') return valA > valB ? -1 : valA < valB ? 1 : 0;
+        return valA < valB ? -1 : valA > valB ? 1 : 0;
+      });
+
+      document.getElementById('cmp-tbody').innerHTML = filtered.slice(0, 50).map(p => {
+        const isFA = !p.ownerRosterId;
+        const added = isCompared(p.player_id);
+        const full = state.compareIds.length >= MAX_COMPARE;
+        const sleeperProjCell = p.sleeperProj != null
+          ? `<span style="font-weight: 700;">${p.sleeperProj.toFixed(1)}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        const myProjCell = p.myProj != null
+          ? `<span style="font-weight: 700; color: var(--accent);">${p.myProj.toFixed(1)}</span>` +
+            (p.myProjFloor != null && p.myProjCeiling != null
+              ? `<div style="font-size: 10px; color: var(--text-muted);">${p.myProjFloor.toFixed(1)}–${p.myProjCeiling.toFixed(1)}</div>`
+              : '')
+          : '<span style="color: var(--text-muted); font-size: 11px;" title="Custom model not loaded">—</span>';
+        return `
+          <tr>
+            <td>
+              <div class="player-row-name">
+                ${rowAvatar(p)}
+                <span style="cursor: pointer;" data-view-player="${p.player_id}">${p.name}</span>
+              </div>
+            </td>
+            <td><span class="pos-badge ${p.position}">${p.position}</span></td>
+            <td>${p.team || 'FA'}</td>
+            <td style="font-size: 12px;">${isFA ? '<span class="free-agent-pill">FA</span>' : getTeamName(p.ownerRosterId)}</td>
+            <td class="right">${sleeperProjCell}</td>
+            <td class="right">${myProjCell}</td>
+            <td>
+              <button class="add-mini-btn ${added ? 'added' : ''}" data-add-id="${p.player_id}" ${added || (full && !added) ? 'disabled' : ''}>
+                ${added ? '✓ Added' : full ? 'Full' : '+ Add'}
+              </button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      document.getElementById('cmp-table-footer').innerHTML = filtered.length > 50
+        ? `<div style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 12px; border-top: 1px solid var(--border);">Showing first 50 of ${filtered.length} · refine filters to see more</div>`
+        : '';
+
+      main.querySelectorAll('[data-add-id]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (addToCompare(btn.dataset.addId)) renderView();
+        });
+      });
+      main.querySelectorAll('[data-view-player]').forEach(el => {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          state.activePlayerId = el.dataset.viewPlayer;
+          renderView();
+        });
+      });
+    }
+
+    renderAddPlayersTable();
 
     // ---- Render charts ----
     if (compared.length > 0 && typeof Chart !== 'undefined') {
@@ -7716,15 +7862,16 @@
       clearCompare();
       renderView();
     });
+    let cmpSearchDebounce = null;
     document.getElementById('cmp-search').addEventListener('input', (e) => {
       state.compareFilters.search = e.target.value;
-      renderView();
-      setTimeout(() => document.getElementById('cmp-search')?.focus(), 0);
+      clearTimeout(cmpSearchDebounce);
+      cmpSearchDebounce = setTimeout(renderAddPlayersTable, 150);
     });
-    document.getElementById('cmp-filter-position').addEventListener('change', (e) => { state.compareFilters.position = e.target.value; renderView(); });
-    document.getElementById('cmp-filter-team').addEventListener('change', (e) => { state.compareFilters.team = e.target.value; renderView(); });
-    document.getElementById('cmp-filter-owner').addEventListener('change', (e) => { state.compareFilters.owner = e.target.value; renderView(); });
-    document.getElementById('cmp-filter-injury').addEventListener('change', (e) => { state.compareFilters.injury = e.target.value; renderView(); });
+    document.getElementById('cmp-filter-position').addEventListener('change', (e) => { state.compareFilters.position = e.target.value; renderAddPlayersTable(); });
+    document.getElementById('cmp-filter-team').addEventListener('change', (e) => { state.compareFilters.team = e.target.value; renderAddPlayersTable(); });
+    document.getElementById('cmp-filter-owner').addEventListener('change', (e) => { state.compareFilters.owner = e.target.value; renderAddPlayersTable(); });
+    document.getElementById('cmp-filter-injury').addEventListener('change', (e) => { state.compareFilters.injury = e.target.value; renderAddPlayersTable(); });
     main.querySelectorAll('th[data-sort]').forEach(th => {
       th.addEventListener('click', () => {
         const col = th.dataset.sort;
@@ -7734,19 +7881,7 @@
           state.compareFilters.sortBy = col;
           state.compareFilters.sortDir = 'desc';
         }
-        renderView();
-      });
-    });
-    main.querySelectorAll('[data-add-id]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        if (addToCompare(btn.dataset.addId)) renderView();
-      });
-    });
-    main.querySelectorAll('[data-view-player]').forEach(el => {
-      el.addEventListener('click', (e) => {
-        e.stopPropagation();
-        state.activePlayerId = el.dataset.viewPlayer;
-        renderView();
+        renderAddPlayersTable();
       });
     });
     main.querySelectorAll('.compare-shelf-card').forEach(el => {
@@ -7889,7 +8024,7 @@
     // screen). The two are compared below so a real trade since shows up
     // as a per-player flag instead of the old blanket disclaimer.
     const totalCandidates = Object.keys(advanced.players || {}).length;
-    let rows = Object.entries(advanced.players || {}).map(([playerId, pd]) => {
+    const baseRows = Object.entries(advanced.players || {}).map(([playerId, pd]) => {
       const raw = playerDb[playerId];
       if (!raw || !RADAR_CONDENSED_AXES[raw.position]) return null; // K/DEF/unresolved -- not modeled
       const condensed = RADAR_CONDENSED_AXES[raw.position];
@@ -7925,23 +8060,6 @@
       };
     }).filter(Boolean);
 
-    if (f.search) rows = rows.filter(r => r.name.toLowerCase().includes(f.search.toLowerCase()));
-    if (f.position !== 'ALL') rows = rows.filter(r => r.position === f.position);
-
-    rows.sort((a, b) => {
-      let valA = a[f.sortBy], valB = b[f.sortBy];
-      // Nulls sort to the bottom regardless of direction (same convention
-      // as the Players table). FP Over Exp/Volatility now populate for
-      // QB too (see PROJECT_CONTEXT.md's QB xFP findings) -- a null here
-      // just means thin bucket/game history, not a QB-shaped gap.
-      if (valA == null && valB == null) return 0;
-      if (valA == null) return 1;
-      if (valB == null) return -1;
-      if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = valB.toLowerCase(); }
-      if (f.sortDir === 'desc') return valA > valB ? -1 : valA < valB ? 1 : 0;
-      return valA < valB ? -1 : valA > valB ? 1 : 0;
-    });
-
     function sortArrow(col) { return f.sortBy === col ? (f.sortDir === 'asc' ? '↑' : '↓') : ''; }
     function pctCell(pct, label, raw, unit) {
       if (pct == null) return '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
@@ -7953,7 +8071,7 @@
       <div class="page-header-row">
         <div>
           <div class="page-title">Draft Prep</div>
-          <div class="page-subtitle">${rows.length} of ${totalCandidates} players${rows.length > 100 ? ' · showing top 100 by current sort' : ''}</div>
+          <div class="page-subtitle" id="draft-prep-subtitle"></div>
         </div>
         <div style="display: flex; gap: 8px; align-items: center;">
           <label style="font-size: 12px; color: var(--text-secondary); font-weight: 600;">Season:</label>
@@ -7997,88 +8115,122 @@
               <th class="right" data-sort="trendSignal" title="This player's single biggest usage-share signal (target/carry/snap share vs. their own baseline) over the final games of the ${season} season -- who was ascending or fading heading into the offseason. A directional read, not a prediction.">End-of-Season Trend ${sortArrow('trendSignal')}</th>
             </tr>
           </thead>
-          <tbody>
-            ${rows.slice(0, 100).map(r => {
-              // Same QB caveat as the Players table's identical cell -- QB's
-              // fp_over_expected strips out meaningfully less luck (0.37 vs.
-              // 0.19 residual correlation, see PROJECT_CONTEXT.md's QB xFP
-              // findings), so it gets its own title rather than sharing the
-              // column header's single tooltip.
-              const fpCellTitle = r.position === 'QB'
-                ? 'For QB, this reflects real accuracy/decision-making more than luck -- a large number here is less certainly luck than the same number for RB/WR/TE.'
-                : '';
-              const fpCell = r.fpOverExp != null
-                ? `<span style="font-weight: 700; color: ${r.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};"${fpCellTitle ? ` title="${fpCellTitle}"` : ''}>${r.fpOverExp > 0 ? '+' : ''}${r.fpOverExp.toFixed(1)}</span>`
-                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
-              const volCell = r.volatility != null
-                ? `<span style="font-weight: 700;">${r.volatility.toFixed(1)}</span>`
-                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
-              const trendCell = r.trendDirection
-                ? `<span style="color: ${r.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${r.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[r.trendFeature]}</span>`
-                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
-              return `
-                <tr data-player-id="${r.playerId}">
-                  <td>
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                      <span class="pos-badge ${r.position}" style="font-size: 9px; padding: 1px 4px;">${r.position}</span>
-                      <div>
-                        <div style="font-weight: 600;">${r.name}</div>
-                        <div style="font-size: 11px; color: var(--text-muted);">
-                          ${r.team}${r.teamChanged
-                            ? ` <span style="color: var(--warning); font-weight: 600;" title="Now on ${r.currentTeam}">⚠ since moved to ${r.currentTeam}</span>`
-                            : ''}
-                        </div>
-                      </div>
-                    </div>
-                  </td>
-                  <td class="right">
-                    <div style="font-weight: 700;">${r.seasonPts != null ? r.seasonPts.toFixed(1) : '—'}</div>
-                    <div style="font-size: 10px; color: var(--text-muted);">${r.gamesPlayed != null ? r.gamesPlayed + ' gm' : ''}</div>
-                  </td>
-                  <td class="right">${fpCell}</td>
-                  <td class="right">${volCell}</td>
-                  <td class="right">${pctCell(r.volumePct, r.volumeLabel, r.volumeRaw, r.volumeUnit)}</td>
-                  <td class="right">${pctCell(r.efficiencyPct, r.efficiencyLabel, r.efficiencyRaw, r.efficiencyUnit)}</td>
-                  <td class="right">${trendCell}</td>
-                </tr>
-              `;
-            }).join('')}
-          </tbody>
+          <tbody id="draft-prep-tbody"></tbody>
         </table>
       </div>
     `;
+
+    // Recomputes the filtered/sorted rows and repaints only the table body
+    // + subtitle count -- never the search input or filter controls.
+    // Mirrors renderPlayersView's renderTbody(): rebuilding the whole view
+    // on every keystroke recreated the <input>, which either lost focus
+    // outright or (when focus() was called to compensate) made typing come
+    // out reversed, since focus() restores focus but not cursor position.
+    function renderPrepRows() {
+      let rows = baseRows;
+      if (f.search) rows = rows.filter(r => r.name.toLowerCase().includes(f.search.toLowerCase()));
+      if (f.position !== 'ALL') rows = rows.filter(r => r.position === f.position);
+
+      rows.sort((a, b) => {
+        let valA = a[f.sortBy], valB = b[f.sortBy];
+        // Nulls sort to the bottom regardless of direction (same convention
+        // as the Players table). FP Over Exp/Volatility now populate for
+        // QB too (see PROJECT_CONTEXT.md's QB xFP findings) -- a null here
+        // just means thin bucket/game history, not a QB-shaped gap.
+        if (valA == null && valB == null) return 0;
+        if (valA == null) return 1;
+        if (valB == null) return -1;
+        if (typeof valA === 'string') { valA = valA.toLowerCase(); valB = valB.toLowerCase(); }
+        if (f.sortDir === 'desc') return valA > valB ? -1 : valA < valB ? 1 : 0;
+        return valA < valB ? -1 : valA > valB ? 1 : 0;
+      });
+
+      document.getElementById('draft-prep-subtitle').textContent =
+        `${rows.length} of ${totalCandidates} players${rows.length > 100 ? ' · showing top 100 by current sort' : ''}`;
+
+      document.getElementById('draft-prep-tbody').innerHTML = rows.slice(0, 100).map(r => {
+        // Same QB caveat as the Players table's identical cell -- QB's
+        // fp_over_expected strips out meaningfully less luck (0.37 vs.
+        // 0.19 residual correlation, see PROJECT_CONTEXT.md's QB xFP
+        // findings), so it gets its own title rather than sharing the
+        // column header's single tooltip.
+        const fpCellTitle = r.position === 'QB'
+          ? 'For QB, this reflects real accuracy/decision-making more than luck -- a large number here is less certainly luck than the same number for RB/WR/TE.'
+          : '';
+        const fpCell = r.fpOverExp != null
+          ? `<span style="font-weight: 700; color: ${r.fpOverExp > 0 ? 'var(--success)' : 'var(--danger)'};"${fpCellTitle ? ` title="${fpCellTitle}"` : ''}>${r.fpOverExp > 0 ? '+' : ''}${r.fpOverExp.toFixed(1)}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        const volCell = r.volatility != null
+          ? `<span style="font-weight: 700;">${r.volatility.toFixed(1)}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        const trendCell = r.trendDirection
+          ? `<span style="color: ${r.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${r.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[r.trendFeature]}</span>`
+          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+        return `
+          <tr data-player-id="${r.playerId}">
+            <td>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span class="pos-badge ${r.position}" style="font-size: 9px; padding: 1px 4px;">${r.position}</span>
+                <div>
+                  <div style="font-weight: 600;">${r.name}</div>
+                  <div style="font-size: 11px; color: var(--text-muted);">
+                    ${r.team}${r.teamChanged
+                      ? ` <span style="color: var(--warning); font-weight: 600;" title="Now on ${r.currentTeam}">⚠ since moved to ${r.currentTeam}</span>`
+                      : ''}
+                  </div>
+                </div>
+              </div>
+            </td>
+            <td class="right">
+              <div style="font-weight: 700;">${r.seasonPts != null ? r.seasonPts.toFixed(1) : '—'}</div>
+              <div style="font-size: 10px; color: var(--text-muted);">${r.gamesPlayed != null ? r.gamesPlayed + ' gm' : ''}</div>
+            </td>
+            <td class="right">${fpCell}</td>
+            <td class="right">${volCell}</td>
+            <td class="right">${pctCell(r.volumePct, r.volumeLabel, r.volumeRaw, r.volumeUnit)}</td>
+            <td class="right">${pctCell(r.efficiencyPct, r.efficiencyLabel, r.efficiencyRaw, r.efficiencyUnit)}</td>
+            <td class="right">${trendCell}</td>
+          </tr>
+        `;
+      }).join('');
+
+      // Row click drills into the full Player Detail page. Switches the
+      // WHOLE dashboard to this archived season first when it isn't already
+      // showing it -- the same "no mixed-season pages" rule Phase 9 applies
+      // everywhere else, so a buy-low candidate never opens into a Player
+      // Detail page still showing a different season's radar/heatmap/KPIs.
+      main.querySelectorAll('table.players-table tr[data-player-id]').forEach(el => {
+        el.addEventListener('click', async () => {
+          if (state.selectedSeason !== season) {
+            await switchSeason(season);
+          }
+          state.activePlayerId = el.dataset.playerId;
+          renderView();
+        });
+      });
+    }
+
+    renderPrepRows();
 
     document.getElementById('draft-prep-season')?.addEventListener('change', (e) => {
       state.draftPrepSeason = Number(e.target.value);
       renderView();
     });
+    let draftPrepSearchDebounce = null;
     document.getElementById('draft-prep-search')?.addEventListener('input', (e) => {
       state.draftPrepFilters.search = e.target.value;
-      renderView();
+      clearTimeout(draftPrepSearchDebounce);
+      draftPrepSearchDebounce = setTimeout(renderPrepRows, 150);
     });
     document.getElementById('draft-prep-position')?.addEventListener('change', (e) => {
       state.draftPrepFilters.position = e.target.value;
-      renderView();
+      renderPrepRows();
     });
     main.querySelectorAll('table.players-table th[data-sort]').forEach(th => {
       th.addEventListener('click', () => {
         const col = th.dataset.sort;
         if (f.sortBy === col) f.sortDir = f.sortDir === 'asc' ? 'desc' : 'asc';
         else { f.sortBy = col; f.sortDir = 'desc'; }
-        renderView();
-      });
-    });
-    // Row click drills into the full Player Detail page. Switches the
-    // WHOLE dashboard to this archived season first when it isn't already
-    // showing it -- the same "no mixed-season pages" rule Phase 9 applies
-    // everywhere else, so a buy-low candidate never opens into a Player
-    // Detail page still showing a different season's radar/heatmap/KPIs.
-    main.querySelectorAll('table.players-table tr[data-player-id]').forEach(el => {
-      el.addEventListener('click', async () => {
-        if (state.selectedSeason !== season) {
-          await switchSeason(season);
-        }
-        state.activePlayerId = el.dataset.playerId;
         renderView();
       });
     });
