@@ -379,16 +379,28 @@ def get_injuries(seasons: Iterable[int], refresh: bool = False) -> pd.DataFrame:
     both). Don't let a caller reshape `practice_status` into a specific
     day's practice; it describes the whole week's report.
 
-    There is also no `date_modified`/last-updated column at any level of
-    this source (same direct check) -- see get_injuries_source_updated_at()
-    for the honest substitute: the whole season file's own last-regenerated
-    timestamp, which is real but file-level, not per-row.
+    `date_modified` DOES exist, and is 100% populated, for every season
+    2018-2024 -- 99.91% of real rows (37,728/37,763 checked) were last
+    modified strictly before that team's own kickoff that week, real
+    empirical confirmation this is a pregame artifact for those seasons,
+    not just an assumption. It is entirely ABSENT (0%) for 2025 and,
+    presumably, every season since -- an earlier version of this docstring
+    claimed the column didn't exist "at any level of this source," checked
+    only against `injuries_2025.parquet`, which happens to be the one
+    season that's true for. A caller relying on `date_modified` for a live
+    or recent season still has nothing to check point-in-time safety
+    against -- see get_injuries_source_updated_at() for the honest
+    file-level substitute (real, but not per-row), which is why that stays
+    the dashboard's own freshness display regardless of this correction.
 
     A small number of rows (well under 1% historically) carry a literal
-    "\\n" or the string "Note" in report_status/practice_status -- a real
-    upstream data-quality artifact, not a status this project's schema
-    should propagate. Normalized to null here, once, at the ingestion
-    boundary, so every caller downstream sees only genuine values.
+    "\\n" (or that plus trailing whitespace) or the string "Note" in
+    report_status/practice_status -- a real upstream data-quality
+    artifact, not a status this project's schema should propagate.
+    Normalized to null here, once, at the ingestion boundary (stripped
+    before comparing, so any whitespace-padded variant is caught too, not
+    just an exact match), so every caller downstream sees only genuine
+    values.
 
     Uses game_type == 'REG' to scope to real games elsewhere in this
     pipeline (see e.g. determine_archive_target_week) -- this function
@@ -410,11 +422,21 @@ def get_injuries(seasons: Iterable[int], refresh: bool = False) -> pd.DataFrame:
     logger.info(f"Fetching injury/practice reports for {seasons}...")
     df = _to_pandas(_retry_transient(nfl.load_injuries, seasons))
     df = _normalize_id_column(df, "gsis_id")
+    # Stripped BEFORE the junk check, not just compared as-is -- a real,
+    # previously-missed variant is "\n" plus trailing spaces, not the bare
+    # "\n" this set matches on its own (found auditing practice_status for
+    # the practice-report predictiveness check: 212 rows of "\n    " slid
+    # through as if they were a real status). Stripping first catches that
+    # and any other whitespace-only junk in one pass, not just the two
+    # exact strings seen so far; the ORIGINAL (unstripped) value is what
+    # gets kept for a real entry, so this doesn't silently trim whitespace
+    # off a genuine status string.
     junk_values = {"\n", "Note", ""}
     for col in ("report_status", "practice_status", "report_primary_injury",
                 "report_secondary_injury", "practice_primary_injury", "practice_secondary_injury"):
         if col in df.columns:
-            df[col] = df[col].where(~df[col].isin(junk_values), pd.NA)
+            is_junk = df[col].astype("string").str.strip().isin(junk_values).fillna(False)
+            df[col] = df[col].where(~is_junk, pd.NA)
     _write_cache_parquet(df, cache_name)
     return df
 
@@ -422,15 +444,20 @@ def get_injuries(seasons: Iterable[int], refresh: bool = False) -> pd.DataFrame:
 def get_injuries_source_updated_at(season: int) -> str | None:
     """
     When nflverse's injuries_{season} release file was last regenerated --
-    the honest substitute for a per-row `date_modified`, which does not
-    exist anywhere in this source (see get_injuries' docstring). This is
+    the honest substitute for a per-row `date_modified`, which exists and
+    is fully populated for 2018-2024 but is entirely absent for 2025 and,
+    presumably, every season since (see get_injuries' docstring for the
+    correction -- an earlier version of this claimed the column never
+    exists at all, checked only against a 2025 file). This function's
     FILE-level freshness ("as of this timestamp, nflverse's whole season
-    snapshot was last touched"), not per-player -- exactly what matters for
-    the one real risk this data has: nflverse runs on its own update
-    schedule and can lag the live, real-world report, most dangerously on a
-    Friday afternoon right before games. Surfacing this beats surfacing
-    nothing, and is honest about being coarser than a per-row timestamp
-    would be.
+    snapshot was last touched"), not per-player, is still the right choice
+    for a caller wanting the CURRENT/live season's freshness specifically
+    -- that's exactly the half where no per-row alternative exists -- and
+    is exactly what matters for the one real risk this data has: nflverse
+    runs on its own update schedule and can lag the live, real-world
+    report, most dangerously on a Friday afternoon right before games.
+    Surfacing this beats surfacing nothing, and is honest about being
+    coarser than a per-row timestamp would be.
 
     Hits the GitHub Releases API directly (nflreadpy exposes no metadata
     endpoint for this) and returns None -- not a guessed/fabricated

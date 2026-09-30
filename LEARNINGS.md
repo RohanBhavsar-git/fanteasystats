@@ -317,6 +317,31 @@ beyond this project.
   happened to get tested first, an artifact of test order, not a real
   property of the feature.
 
+- **Bundling a feature family's sub-signals hides opposite-signed effects —
+  twice now, in two unrelated data sources.** First: game-context data's
+  Vegas/schedule and weather sub-blocks, tested together as one bundle,
+  read as "roughly no effect" for running backs (a combined −0.008 MAE,
+  squarely in noise range) — actually a real −0.027 gain from Vegas/schedule
+  and a real +0.015 loss from weather, almost exactly canceling. Second,
+  a completely unrelated data source: an official injury report's two
+  sub-signals (the game-status designation, and that week's practice-
+  participation read) tested together for quarterbacks read as a modest
+  −0.021 gain — actually practice-participation alone is nearly twice as
+  good (−0.036), while the game-status designation alone is a real *loss*
+  (+0.026) that erodes most of the other signal's benefit once bundled.
+  *Caught by*: testing each sub-signal from a feature family separately,
+  every time, not only when a block-level number already looks suspicious
+  — the running-back case is the important one to sit with, because −0.008
+  looks exactly like an unremarkable small real effect, not a number that
+  demands a second look; nothing about it hints that two larger,
+  opposite-signed effects are hiding underneath. **The generalizable rule,
+  not just two anecdotes**: whenever a "feature family" bundles more than
+  one underlying signal from a shared source, test the sub-signals apart
+  before drawing any conclusion about the bundle — a block-level average
+  cannot distinguish "genuinely nothing here" from "two real, opposite-
+  signed somethings," and there is no way to tell which one you're looking
+  at from the bundled number alone.
+
 - **The Sleeper-projection false alarm.** A real, reasonable worry going in:
   does Sleeper's *projections* endpoint use the same stat-name vocabulary as
   the league's own scoring rules, the way the raw play-by-play data needs an
