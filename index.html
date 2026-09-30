@@ -2623,7 +2623,7 @@
   let state = {
     selectedSeason: null,    // which SEASON_OPTIONS entry is active -- set by init()/switchSeason()
     league: { name: '', season: '', settings: {} }, users: [], rosters: [],
-    weeklyMatchups: {}, activityByWeek: {}, nflGames: [],
+    weeklyMatchups: {}, activityByWeek: {}, rawTransactionsByWeek: {}, nflGames: [],
     liveNflGames: [],       // stable snapshot of the live season's ACTUAL current-week ESPN games --
                              // unlike nflGames, never reassigned by the sidebar's own week-browsing
                              // dropdown, so the matchup detail's per-player game-status indicator
@@ -3058,11 +3058,21 @@
 
     // Step 4: Fetch transactions for activity feed (current week)
     let activityByWeek = {};
+    // Same fetch as activityByWeek above, kept in its own RAW (pre-display-
+    // mapped) form too -- mapSleeperTransactions collapses each transaction
+    // into a formatted description string, which is fine for the Activity
+    // Feed but useless for programmatically asking "which roster added
+    // which player, and when" (Team Detail's "best in-season addition"
+    // superlative needs exactly that). No extra network cost: this is the
+    // same response already being fetched for activityByWeek, just also
+    // kept before mapping instead of discarded after.
+    let rawTransactionsByWeek = {};
     await Promise.all(availableWeeks.map(async w => {
       try {
         const txns = await fetchJSON(`${API}/league/${league.league_id}/transactions/${w}`);
         activityByWeek[w] = mapSleeperTransactions(txns, users, rosters, playerDb);
-      } catch (e) { activityByWeek[w] = []; }
+        rawTransactionsByWeek[w] = txns;
+      } catch (e) { activityByWeek[w] = []; rawTransactionsByWeek[w] = []; }
     }));
 
     // Step 5: Fetch NFL games from ESPN -- LIVE season only. ESPN's
@@ -3127,6 +3137,7 @@
       playersById: Object.fromEntries(players.map(p => [p.player_id, p])),
       weeklyMatchups: matchupsByWeek,
       activityByWeek,
+      rawTransactionsByWeek,
       winnersBracket: winnersBracket || [],
       losersBracket: losersBracket || [],
       draft: draft || null,
@@ -6373,40 +6384,379 @@
   }
 
   // ----- TEAM DETAIL -----
+  // ===========================================================================
+  // TEAM DETAIL: season-long roster analytics
+  // ===========================================================================
+  // Real, Sleeper-scored per-player-per-week data for one roster, built ONLY
+  // from weeks that have actually been played -- the shared foundation for
+  // the roster table's Avg/Total (previously always 0, see mapSleeperPlayers'
+  // own "computed in Sprint 5" comment that never happened) and every
+  // season-long stat below it (bench points left, best/worst slot, the
+  // superlatives). Reuses buildLineupForRoster's own real starters/bench/
+  // per-player points extraction -- Sleeper's own custom-scored numbers for
+  // this league, not re-derived from raw stats -- rather than a parallel
+  // computation reading state.statsByWeek the way Player Detail's own
+  // season total does. Two real, independent sources computing "this
+  // player's season total" would eventually disagree; this one is correct
+  // for THIS page's purpose (what actually happened on THIS roster) even
+  // for a player no longer rostered here today.
+  //
+  // Same MIN_GAMES_FOR_TREND discipline the trend feature already uses
+  // (src/usage.py) for the consistency/boom-bust superlatives below --
+  // "most consistent" over 3 starts is noise, not a finding.
+  const TEAM_DETAIL_MIN_STARTS = 5;
+
+  // A week counts as played the same way computeTeamForm already decides
+  // it (Sleeper returns 0-0 for a real pairing that just hasn't happened
+  // yet) -- reusing that exact convention rather than a second one.
+  function getPlayedWeeksForRoster(rosterId) {
+    return getAvailableWeeks().filter(w => {
+      const m = (state.weeklyMatchups[w] || []).find(x => x.home === rosterId || x.away === rosterId);
+      if (!m) return false;
+      const isHome = m.home === rosterId;
+      const myPts = isHome ? m.homePts : m.awayPts;
+      const oppPts = isHome ? m.awayPts : m.homePts;
+      return !(myPts === 0 && oppPts === 0);
+    });
+  }
+
+  function slotEligiblePositions(slot) {
+    if (slot === 'FLEX' || slot === 'WRRB_FLEX' || slot === 'REC_FLEX') return ['RB', 'WR', 'TE'];
+    if (slot === 'SUPER_FLEX') return ['QB', 'RB', 'WR', 'TE'];
+    return [slot];
+  }
+
+  // Best possible total from one real week's full player pool (starters +
+  // bench), given this league's real roster_positions. Fixed-position
+  // slots (QB, RB, ..., K, DEF) each take the single best remaining
+  // player at that exact position; slots with more than one eligible
+  // position (FLEX) are grouped by their exact eligibility set and take
+  // the top-N remaining eligible players for however many slots share
+  // that set. Provably optimal for independent fixed slots plus flex
+  // slots that don't overlap with a DIFFERENT flex kind's own eligible
+  // pool -- this league (like most Sleeper defaults) only ever has one
+  // flex kind at a time, so this doesn't need a full assignment-problem
+  // solver for the rarer case of two overlapping-but-different flex
+  // slots (e.g. FLEX + SUPER_FLEX together) sharing part of the same pool.
+  function computeOptimalLineupTotal(slots, pool) {
+    const remaining = pool.map(p => ({ ...p }));
+    let total = 0;
+    const fixedSlots = slots.filter(s => slotEligiblePositions(s).length === 1);
+    const flexSlots = slots.filter(s => slotEligiblePositions(s).length > 1);
+
+    fixedSlots.forEach(slot => {
+      const pos = slotEligiblePositions(slot)[0];
+      let bestIdx = -1, bestPts = -Infinity;
+      remaining.forEach((p, i) => { if (p.position === pos && p.pts > bestPts) { bestPts = p.pts; bestIdx = i; } });
+      if (bestIdx >= 0) { total += remaining[bestIdx].pts; remaining.splice(bestIdx, 1); }
+    });
+
+    const flexGroups = {};
+    flexSlots.forEach(slot => {
+      const key = slotEligiblePositions(slot).slice().sort().join(',');
+      flexGroups[key] = (flexGroups[key] || 0) + 1;
+    });
+    Object.entries(flexGroups).forEach(([key, count]) => {
+      const eligible = key.split(',');
+      const candidates = remaining
+        .map((p, i) => ({ ...p, i }))
+        .filter(p => eligible.includes(p.position))
+        .sort((a, b) => b.pts - a.pts)
+        .slice(0, count);
+      total += candidates.reduce((s, c) => s + c.pts, 0);
+      const usedIdx = new Set(candidates.map(c => c.i));
+      for (let i = remaining.length - 1; i >= 0; i--) if (usedIdx.has(i)) remaining.splice(i, 1);
+    });
+
+    return total;
+  }
+
+  // The core pass: every real played week's real lineup for one roster,
+  // plus each player's own weekly line (points, starter/bench, slot).
+  // Everything else on this page (season totals, bench points, slot
+  // value, every superlative) reads from this single pass.
+  function buildRosterSeasonData(rosterId) {
+    const playedWeeks = getPlayedWeeksForRoster(rosterId);
+    const slots = getStartingSlots();
+    const byPlayer = {};
+    const weekly = [];
+
+    playedWeeks.forEach(w => {
+      const matchups = state.weeklyMatchups[w] || [];
+      const m = matchups.find(x => x.home === rosterId || x.away === rosterId);
+      const lineup = buildLineupForRoster(rosterId, m);
+      const pool = [];
+      const slotPts = {};
+
+      lineup.starters.forEach(s => {
+        if (!s.player) return;
+        pool.push({ player_id: s.player.player_id, position: s.player.position, pts: s.weekPts });
+        if (!byPlayer[s.player.player_id]) byPlayer[s.player.player_id] = { player: s.player, weeks: [] };
+        byPlayer[s.player.player_id].weeks.push({ week: w, pts: s.weekPts, isStarter: true, slot: s.slot });
+        slotPts[s.slot] = (slotPts[s.slot] || 0) + s.weekPts;
+      });
+      lineup.bench.forEach(p => {
+        pool.push({ player_id: p.player_id, position: p.position, pts: p.weekPts });
+        if (!byPlayer[p.player_id]) byPlayer[p.player_id] = { player: p, weeks: [] };
+        byPlayer[p.player_id].weeks.push({ week: w, pts: p.weekPts, isStarter: false, slot: null });
+      });
+
+      const actualTotal = lineup.starters.reduce((s, x) => s + (x.player ? x.weekPts : 0), 0);
+      const optimalTotal = computeOptimalLineupTotal(slots, pool);
+      weekly.push({ week: w, actualTotal, optimalTotal, slotPts, lineup });
+    });
+
+    return { rosterId, playedWeeks, byPlayer, weekly };
+  }
+
+  function computeSlotAverages(seasonData) {
+    const totals = {};
+    seasonData.weekly.forEach(w => {
+      Object.entries(w.slotPts).forEach(([slot, pts]) => {
+        if (!totals[slot]) totals[slot] = { sum: 0, n: 0 };
+        totals[slot].sum += pts; totals[slot].n += 1;
+      });
+    });
+    const avgs = {};
+    Object.entries(totals).forEach(([slot, t]) => { avgs[slot] = t.sum / t.n; });
+    return avgs;
+  }
+
+  // {week, myPts, oppPts, won, leagueAvg, percentile} per played week --
+  // percentile is the share of every OTHER real score league-wide that
+  // week this team's own score beat, the shared basis for "record vs.
+  // league average" and the luckiest/unluckiest-week superlative.
+  function computeWeeklyLeagueContext(rosterId, playedWeeks) {
+    return playedWeeks.map(w => {
+      const matchups = state.weeklyMatchups[w] || [];
+      const allScores = matchups.flatMap(x => [x.homePts, x.awayPts]);
+      const m = matchups.find(x => x.home === rosterId || x.away === rosterId);
+      const isHome = m.home === rosterId;
+      const myPts = isHome ? m.homePts : m.awayPts;
+      const oppPts = isHome ? m.awayPts : m.homePts;
+      const leagueAvg = allScores.length ? allScores.reduce((a, b) => a + b, 0) / allScores.length : null;
+      // allScores includes this team's own score once -- "strictly less
+      // than myPts" already excludes that self-entry on its own (a value
+      // is never less than itself), so the count below is already "how
+      // many OTHER scores this beat," no separate self-exclusion needed.
+      const others = allScores.length > 1 ? allScores.length - 1 : 0;
+      const beatOthers = allScores.filter(s => s < myPts).length;
+      const percentile = others > 0 ? Math.min(1, beatOthers / others) : null;
+      return { week: w, myPts, oppPts, won: myPts > oppPts, leagueAvg, percentile };
+    });
+  }
+
+  function computeBiggestBenchMistake(seasonData) {
+    let best = null;
+    seasonData.weekly.forEach(w => {
+      w.lineup.starters.forEach(s => {
+        if (!s.player) return;
+        const eligible = slotEligiblePositions(s.slot);
+        const benchAlt = w.lineup.bench
+          .filter(b => eligible.includes(b.position))
+          .sort((a, b) => b.weekPts - a.weekPts)[0];
+        if (benchAlt && benchAlt.weekPts > s.weekPts) {
+          const margin = benchAlt.weekPts - s.weekPts;
+          if (!best || margin > best.margin) {
+            best = {
+              week: w.week, slot: s.slot, startedPlayer: s.player, benchPlayer: benchAlt,
+              margin, startedPts: s.weekPts, benchPts: benchAlt.weekPts,
+            };
+          }
+        }
+      });
+    });
+    return best;
+  }
+
+  function computeConsistencySuperlatives(seasonData) {
+    const allStartCounts = Object.values(seasonData.byPlayer).map(d => d.weeks.filter(w => w.isStarter).length);
+    const mostStarts = allStartCounts.length ? Math.max(...allStartCounts) : 0;
+    const candidates = Object.values(seasonData.byPlayer).map(({ player, weeks }) => {
+      const starts = weeks.filter(w => w.isStarter);
+      if (starts.length < TEAM_DETAIL_MIN_STARTS) return null;
+      const pts = starts.map(w => w.pts);
+      const mean = pts.reduce((a, b) => a + b, 0) / pts.length;
+      if (mean <= 0) return null;
+      const variance = pts.reduce((s, p) => s + (p - mean) ** 2, 0) / pts.length;
+      const cv = Math.sqrt(variance) / mean;
+      return { player, starts: starts.length, mean, cv };
+    }).filter(Boolean);
+
+    if (!candidates.length) return { eligible: false, mostStarts };
+    candidates.sort((a, b) => a.cv - b.cv);
+    return { eligible: true, mostConsistent: candidates[0], boomBust: candidates[candidates.length - 1] };
+  }
+
+  // Real waiver/free-agent adds onto THIS roster, from raw (pre-display-
+  // mapped) transaction history -- a genuine trade is deliberately
+  // excluded, not just unhandled: "value since arriving" answers a
+  // different, muddier question for a trade (what did we give up?) than
+  // for a free pickup.
+  function computeBestInSeasonAddition(rosterId, seasonData) {
+    const addedWeek = {};
+    Object.entries(state.rawTransactionsByWeek || {}).forEach(([week, txns]) => {
+      (txns || []).forEach(t => {
+        if (t.status !== 'complete') return;
+        if (t.type !== 'waiver' && t.type !== 'free_agent') return;
+        Object.entries(t.adds || {}).forEach(([pid, rid]) => {
+          if (rid !== rosterId) return;
+          const w = parseInt(week, 10);
+          // Week-1 waiver/FA activity is roster formation (the scramble
+          // right after the draft, before or during the season's first
+          // real week), not a genuine "found this on the wire mid-season"
+          // story -- excluded so the pool here is real in-season pickups
+          // only, not every player who wasn't drafted.
+          if (w <= 1) return;
+          if (addedWeek[pid] == null || w < addedWeek[pid]) addedWeek[pid] = w;
+        });
+      });
+    });
+
+    const candidates = Object.entries(addedWeek).map(([pid, addWeek]) => {
+      const data = seasonData.byPlayer[pid];
+      if (!data) return null;
+      const since = data.weeks.filter(w => w.week >= addWeek);
+      if (since.length < 2) return null;
+      const total = since.reduce((s, w) => s + w.pts, 0);
+      return { player: data.player, addWeek, games: since.length, avg: total / since.length };
+    }).filter(Boolean);
+
+    if (!candidates.length) return { hasAdditions: Object.keys(addedWeek).length > 0, best: null };
+    candidates.sort((a, b) => b.avg - a.avg);
+    return { hasAdditions: true, best: candidates[0] };
+  }
+
   function renderTeamDetail(main) {
     const team = getStandings().find(t => t.rosterId === state.activeTeamId);
     if (!team) { state.activeTeamId = null; return renderView(); }
 
+    const season = state.league?.season;
+    const currentWeek = getCurrentWeek();
     const lineup = buildLineupForRoster(state.activeTeamId);
     const allPlayers = [...lineup.starters.map(s => s.player), ...lineup.bench].filter(Boolean);
 
-    // Build weekly point history from this team's matchups
-    const weeks = getAvailableWeeks();
-    const weeklyData = weeks.map(w => {
+    // Every OTHER roster's own season data too -- needed only for the
+    // best/worst starting-slot KPI (this team's per-slot average compared
+    // against the league-wide average at that same slot). Cheap: a
+    // handful of already-played weeks x 14 rosters x ~15 players, no
+    // network calls, everything already sitting in state.weeklyMatchups.
+    const allRosterSeasonData = {};
+    state.rosters.forEach(r => { allRosterSeasonData[r.roster_id] = buildRosterSeasonData(r.roster_id); });
+    const seasonData = allRosterSeasonData[state.activeTeamId];
+    const playedWeeks = seasonData.playedWeeks;
+    const hasPlayedGames = playedWeeks.length > 0;
+
+    // Real per-player season Avg/Total for the roster table -- the actual
+    // fix for mapSleeperPlayers' own seasonAvg:0/totalPts:0 fields, which
+    // were never computed anywhere (confirmed: nothing else in this file
+    // reads them besides the dead getPlayerWeekScore legacy helper).
+    // Computed fresh here rather than mutating the shared player objects
+    // from state.players/state.playersById, which other views (Players
+    // table, Player Detail) read too -- this keeps the fix local to what
+    // actually needed it.
+    function realSeasonLine(playerId) {
+      const data = seasonData.byPlayer[playerId];
+      if (!data || !data.weeks.length) return { avg: 0, total: 0, games: 0 };
+      const total = data.weeks.reduce((s, w) => s + w.pts, 0);
+      return { avg: total / data.weeks.length, total, games: data.weeks.length };
+    }
+
+    // Weekly point history + full schedule, both correctly distinguishing
+    // played weeks from upcoming ones now that getAvailableWeeks() can
+    // return weeks beyond the current one -- Sleeper returns a real 0-0
+    // pairing for a week that hasn't happened yet, which used to get
+    // silently plotted as a 0-point "worst week" and scored as a loss on
+    // the schedule list.
+    const weeklyData = playedWeeks.map(w => {
       const m = (state.weeklyMatchups[w] || []).find(x => x.home === state.activeTeamId || x.away === state.activeTeamId);
-      if (!m) return { week: w, points: 0, opp: 0 };
       const isHome = m.home === state.activeTeamId;
       return { week: w, points: isHome ? m.homePts : m.awayPts, opp: isHome ? m.awayPts : m.homePts };
     });
 
     const games = team.wins + team.losses + team.ties;
     const avgPts = games > 0 ? team.pf / games : null;
-    const bestWeek = [...weeklyData].sort((a, b) => b.points - a.points)[0];
-    const worstWeek = [...weeklyData].sort((a, b) => a.points - b.points)[0];
+    const bestWeek = weeklyData.length ? [...weeklyData].sort((a, b) => b.points - a.points)[0] : null;
+    const worstWeek = weeklyData.length ? [...weeklyData].sort((a, b) => a.points - b.points)[0] : null;
 
     const recordStr = team.ties > 0 ? `${team.wins}-${team.losses}-${team.ties}` : `${team.wins}-${team.losses}`;
 
-    // Build full season schedule (use all available weeks)
-    const schedule = weeks.map(w => {
+    const schedule = getAvailableWeeks().map(w => {
       const m = (state.weeklyMatchups[w] || []).find(x => x.home === state.activeTeamId || x.away === state.activeTeamId);
       if (!m) return null;
       const isHome = m.home === state.activeTeamId;
       const myPts = isHome ? m.homePts : m.awayPts;
       const oppPts = isHome ? m.awayPts : m.homePts;
       const oppRosterId = isHome ? m.away : m.home;
-      const win = myPts > oppPts;
-      return { week: w, opp: getTeamName(oppRosterId), oppRosterId, myPts, oppPts, result: win ? 'W' : 'L', upcoming: false };
+      const played = !(myPts === 0 && oppPts === 0);
+      const result = !played ? 'upcoming' : (myPts > oppPts ? 'W' : 'L');
+      return { week: w, opp: getTeamName(oppRosterId), oppRosterId, myPts, oppPts, result, played };
     }).filter(Boolean);
+
+    // ---- Season Report Card KPIs -----------------------------------
+    const benchPointsLeft = seasonData.weekly.reduce((s, w) => s + Math.max(0, w.optimalTotal - w.actualTotal), 0);
+    const benchPointsLeftPerGame = hasPlayedGames ? benchPointsLeft / playedWeeks.length : null;
+
+    const mySlotAvgs = computeSlotAverages(seasonData);
+    const leagueSlotTotals = {};
+    Object.values(allRosterSeasonData).forEach(rd => {
+      rd.weekly.forEach(w => {
+        Object.entries(w.slotPts).forEach(([slot, pts]) => {
+          if (!leagueSlotTotals[slot]) leagueSlotTotals[slot] = { sum: 0, n: 0 };
+          leagueSlotTotals[slot].sum += pts; leagueSlotTotals[slot].n += 1;
+        });
+      });
+    });
+    const leagueSlotAvgs = {};
+    Object.entries(leagueSlotTotals).forEach(([slot, t]) => { leagueSlotAvgs[slot] = t.sum / t.n; });
+    const slotDeltas = Object.entries(mySlotAvgs)
+      .map(([slot, avg]) => ({ slot, avg, delta: avg - (leagueSlotAvgs[slot] ?? avg) }))
+      .sort((a, b) => b.delta - a.delta);
+    const bestSlot = slotDeltas.length ? slotDeltas[0] : null;
+    const worstSlot = slotDeltas.length > 1 ? slotDeltas[slotDeltas.length - 1] : null;
+
+    const weeklyContext = computeWeeklyLeagueContext(state.activeTeamId, playedWeeks);
+    const hypoWins = weeklyContext.filter(w => w.leagueAvg != null && w.myPts > w.leagueAvg).length;
+    const hypoLosses = weeklyContext.filter(w => w.leagueAvg != null).length - hypoWins;
+    const luckDelta = team.wins - hypoWins; // positive = winning more than raw scoring alone would predict
+
+    const playoffPct = getPlayoffOdds(state.activeTeamId);
+
+    // ---- Visuals: positional breakdown + cumulative trajectory -----
+    const positionTotals = {};
+    seasonData.weekly.forEach(w => {
+      w.lineup.starters.forEach(s => {
+        if (!s.player) return;
+        positionTotals[s.player.position] = (positionTotals[s.player.position] || 0) + s.weekPts;
+      });
+    });
+    const POSITION_COLORS = { QB: '#10b981', RB: '#f59e0b', WR: '#0891b2', TE: '#8b5cf6', K: '#64748b', DEF: '#ef4444' };
+    const positionOrder = ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'].filter(p => positionTotals[p] > 0);
+
+    let myCum = 0, leagueCum = 0;
+    const trajectory = weeklyContext.map(w => {
+      myCum += w.myPts;
+      leagueCum += (w.leagueAvg ?? 0);
+      return { week: w.week, myCum, leagueCum };
+    });
+
+    // ---- Superlatives (gated on real sample size) -------------------
+    const benchMistake = hasPlayedGames ? computeBiggestBenchMistake(seasonData) : null;
+    const consistency = computeConsistencySuperlatives(seasonData);
+    const addition = computeBestInSeasonAddition(state.activeTeamId, seasonData);
+    const wonWeeks = weeklyContext.filter(w => w.won && w.percentile != null);
+    const lostWeeks = weeklyContext.filter(w => !w.won && w.percentile != null);
+    const luckiestWeek = wonWeeks.length ? [...wonWeeks].sort((a, b) => a.percentile - b.percentile)[0] : null;
+    const unluckiestWeek = lostWeeks.length ? [...lostWeeks].sort((a, b) => b.percentile - a.percentile)[0] : null;
+
+    const statCard = (label, value, sub) => `
+      <div class="td-stat">
+        <div class="td-stat-label">${label}</div>
+        <div class="td-stat-value">${value}</div>
+        <div class="td-stat-sub">${sub}</div>
+      </div>
+    `;
+    const noDataStatCard = (label) => statCard(label, '—', 'No games yet');
 
     main.innerHTML = `
       <div class="back-btn" id="td-back">← Back to Teams</div>
@@ -6430,16 +6780,12 @@
             <div class="td-stat-value">${team.pa.toFixed(1)}</div>
             <div class="td-stat-sub">${games > 0 ? (team.pa / games).toFixed(1) + ' avg' : 'No games yet'}</div>
           </div>
-          <div class="td-stat">
-            <div class="td-stat-label">Best Week</div>
-            <div class="td-stat-value">${bestWeek.points.toFixed(1)}</div>
-            <div class="td-stat-sub">Week ${bestWeek.week}</div>
-          </div>
-          <div class="td-stat">
-            <div class="td-stat-label">Worst Week</div>
-            <div class="td-stat-value">${worstWeek.points.toFixed(1)}</div>
-            <div class="td-stat-sub">Week ${worstWeek.week}</div>
-          </div>
+          ${bestWeek
+            ? statCard('Best Week', bestWeek.points.toFixed(1), `Week ${bestWeek.week}`)
+            : noDataStatCard('Best Week')}
+          ${worstWeek
+            ? statCard('Worst Week', worstWeek.points.toFixed(1), `Week ${worstWeek.week}`)
+            : noDataStatCard('Worst Week')}
           <div class="td-stat">
             <div class="td-stat-label">Streak</div>
             <div class="td-stat-value" style="color: ${team.streakType === 'win' ? 'var(--success)' : 'var(--danger)'};">${team.streak} ${team.streakType === 'win' ? 'W' : 'L'}</div>
@@ -6448,7 +6794,38 @@
         </div>
       </div>
 
-      <div class="td-grid">
+      <div class="panel" style="margin-top: 16px;">
+        <div class="panel-header">
+          <div class="panel-title">Season Report Card</div>
+          <div class="panel-note">${hasPlayedGames ? `Through Week ${playedWeeks[playedWeeks.length - 1]}` : 'No games played yet'}</div>
+        </div>
+        <div class="td-stat-grid">
+          ${hasPlayedGames ? statCard(
+            'Points Left on Bench', benchPointsLeft.toFixed(1),
+            `${benchPointsLeftPerGame.toFixed(1)}/gm · best possible lineup each week`
+          ) : noDataStatCard('Points Left on Bench')}
+          ${bestSlot ? statCard(
+            'Best Starting Slot', bestSlot.slot,
+            `${bestSlot.delta >= 0 ? '+' : ''}${bestSlot.delta.toFixed(1)} vs. league avg at that slot`
+          ) : noDataStatCard('Best Starting Slot')}
+          ${worstSlot ? statCard(
+            'Worst Starting Slot', worstSlot.slot,
+            `${worstSlot.delta >= 0 ? '+' : ''}${worstSlot.delta.toFixed(1)} vs. league avg at that slot`
+          ) : noDataStatCard('Worst Starting Slot')}
+          ${hasPlayedGames ? statCard(
+            'Record vs. League Avg', `${hypoWins}-${hypoLosses}`,
+            luckDelta === 0 ? `Matches your real ${team.wins}-${team.losses} record`
+              : luckDelta > 0 ? `Real record is ${Math.abs(luckDelta)} win${Math.abs(luckDelta) === 1 ? '' : 's'} better — lucky matchups`
+              : `Real record is ${Math.abs(luckDelta)} win${Math.abs(luckDelta) === 1 ? '' : 's'} worse — unlucky matchups`
+          ) : noDataStatCard('Record vs. League Avg')}
+          ${statCard(
+            'Playoff Odds', playoffPct != null ? `${playoffPct}%` : '—',
+            playoffPct != null ? 'Simulated, this week’s model run' : 'Not available for this week'
+          )}
+        </div>
+      </div>
+
+      <div class="td-grid" style="margin-top: 16px;">
         <div class="panel">
           <div class="panel-header">
             <div class="panel-title">Weekly Performance</div>
@@ -6465,21 +6842,173 @@
           </div>
           <div class="schedule-list">
             ${schedule.map(s => `
-              <div class="schedule-row" data-week="${s.week}">
+              <div class="schedule-row" data-week="${s.week}" data-played="${s.played}">
                 <span class="schedule-week">W${s.week}</span>
                 <span class="schedule-opp">vs ${s.opp}</span>
-                <span class="schedule-result-pill ${s.result}">${s.result}</span>
-                <span class="schedule-score">${s.myPts.toFixed(1)} - ${s.oppPts.toFixed(1)}</span>
+                <span class="schedule-result-pill ${s.result}">${s.result === 'upcoming' ? 'Upcoming' : s.result}</span>
+                <span class="schedule-score">${s.played ? `${s.myPts.toFixed(1)} - ${s.oppPts.toFixed(1)}` : '—'}</span>
               </div>
             `).join('')}
           </div>
         </div>
       </div>
 
+      <div class="td-grid" style="margin-top: 16px;">
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Positional Scoring</div>
+            <div class="panel-note">Actual starter points by position, season to date</div>
+          </div>
+          ${positionOrder.length ? `
+            <div class="tendency-donuts-row">
+              <div class="tendency-donut-wrap" style="flex: 1 1 220px;">
+                <div class="tendency-donut-canvas-wrap" style="height: 200px;"><canvas id="td-position-donut"></canvas></div>
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 6px; justify-content: center;">
+                ${positionOrder.map(pos => `
+                  <div style="display: flex; align-items: center; gap: 8px; font-size: 12px;">
+                    <i style="width: 10px; height: 10px; border-radius: 2px; background: ${POSITION_COLORS[pos]}; display: inline-block;"></i>
+                    <span class="pos-badge ${pos}" style="font-size: 9px;">${pos}</span>
+                    <span style="color: var(--text-muted);">${positionTotals[pos].toFixed(1)} pts</span>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          ` : `
+            <div class="pd-placeholder">
+              <div class="pd-placeholder-icon">📊</div>
+              <div class="pd-placeholder-title">No games played yet</div>
+              <div class="pd-placeholder-text">Positional scoring populates once this team's real starters have real weeks on the board.</div>
+            </div>
+          `}
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Season Trajectory</div>
+            <div class="panel-note">Cumulative points for vs. league average</div>
+          </div>
+          <div class="chart-wrapper" style="height: 200px;">
+            <canvas id="td-trajectory-chart"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top: 16px;">
+        <div class="panel-header">
+          <div class="panel-title">Superlatives</div>
+          <div class="panel-note">Real season-to-date extremes -- each gated on its own real sample</div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px;">
+          ${benchMistake ? `
+            <div class="kpi-card">
+              <div class="kpi-icon target">🪑</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Biggest Bench Mistake</div>
+                <div class="kpi-value">+${benchMistake.margin.toFixed(1)} pts</div>
+                <div class="kpi-sub">Wk ${benchMistake.week}: started ${benchMistake.startedPlayer.name} (${benchMistake.startedPts.toFixed(1)}) over ${benchMistake.benchPlayer.name} (${benchMistake.benchPts.toFixed(1)}) at ${benchMistake.slot}</div>
+              </div>
+            </div>
+          ` : `
+            <div class="kpi-card">
+              <div class="kpi-icon target">🪑</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Biggest Bench Mistake</div>
+                <div class="kpi-value" style="color: var(--text-muted);">—</div>
+                <div class="kpi-sub">No played weeks yet, or the bench never outscored a starter</div>
+              </div>
+            </div>
+          `}
+          ${consistency.eligible ? `
+            <div class="kpi-card">
+              <div class="kpi-icon trend">🎯</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Most Consistent Starter</div>
+                <div class="kpi-value">${consistency.mostConsistent.player.name}</div>
+                <div class="kpi-sub">${consistency.mostConsistent.mean.toFixed(1)} avg over ${consistency.mostConsistent.starts} starts, CV ${consistency.mostConsistent.cv.toFixed(2)}</div>
+              </div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-icon target">🎢</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Boom-or-Bust</div>
+                <div class="kpi-value">${consistency.boomBust.player.name}</div>
+                <div class="kpi-sub">${consistency.boomBust.mean.toFixed(1)} avg over ${consistency.boomBust.starts} starts, CV ${consistency.boomBust.cv.toFixed(2)}</div>
+              </div>
+            </div>
+          ` : `
+            <div class="kpi-card">
+              <div class="kpi-icon target">🎯</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Most Consistent Starter / Boom-or-Bust</div>
+                <div class="kpi-value" style="color: var(--text-muted);">Not enough starts yet</div>
+                <div class="kpi-sub">Needs ${TEAM_DETAIL_MIN_STARTS} starts from one player -- your most-started player has ${consistency.mostStarts} so far</div>
+              </div>
+            </div>
+          `}
+          ${addition.best ? `
+            <div class="kpi-card">
+              <div class="kpi-icon trend">📈</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Best In-Season Addition</div>
+                <div class="kpi-value">${addition.best.player.name}</div>
+                <div class="kpi-sub">${addition.best.avg.toFixed(1)} avg over ${addition.best.games} games since Wk ${addition.best.addWeek} (waiver/FA)</div>
+              </div>
+            </div>
+          ` : `
+            <div class="kpi-card">
+              <div class="kpi-icon target">📈</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Best In-Season Addition</div>
+                <div class="kpi-value" style="color: var(--text-muted);">—</div>
+                <div class="kpi-sub">${addition.hasAdditions ? 'Too soon since the last waiver/FA add for an honest read' : 'No waiver or free-agent adds on this roster yet this season'}</div>
+              </div>
+            </div>
+          `}
+          ${luckiestWeek ? `
+            <div class="kpi-card">
+              <div class="kpi-icon trend">🍀</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Luckiest Week</div>
+                <div class="kpi-value">Week ${luckiestWeek.week}</div>
+                <div class="kpi-sub">Won at ${luckiestWeek.myPts.toFixed(1)} pts -- beat only ${(luckiestWeek.percentile * 100).toFixed(0)}% of the league that week</div>
+              </div>
+            </div>
+          ` : `
+            <div class="kpi-card">
+              <div class="kpi-icon target">🍀</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Luckiest Week</div>
+                <div class="kpi-value" style="color: var(--text-muted);">—</div>
+                <div class="kpi-sub">No wins yet this season</div>
+              </div>
+            </div>
+          `}
+          ${unluckiestWeek ? `
+            <div class="kpi-card">
+              <div class="kpi-icon target">☔</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Unluckiest Week</div>
+                <div class="kpi-value">Week ${unluckiestWeek.week}</div>
+                <div class="kpi-sub">Lost at ${unluckiestWeek.myPts.toFixed(1)} pts -- beat ${(unluckiestWeek.percentile * 100).toFixed(0)}% of the league that week</div>
+              </div>
+            </div>
+          ` : `
+            <div class="kpi-card">
+              <div class="kpi-icon trend">☔</div>
+              <div class="kpi-content">
+                <div class="kpi-label">Unluckiest Week</div>
+                <div class="kpi-value" style="color: var(--text-muted);">—</div>
+                <div class="kpi-sub">No losses yet this season</div>
+              </div>
+            </div>
+          `}
+        </div>
+      </div>
+
       <div class="panel" style="margin-top: 16px;">
         <div class="panel-header">
           <div class="panel-title">Roster</div>
-          <div class="panel-note">${allPlayers.length} players · Click for player detail</div>
+          <div class="panel-note">${allPlayers.length} players · real season Avg/Total · Click for player detail</div>
         </div>
         <table class="players-table">
           <thead>
@@ -6487,26 +7016,46 @@
               <th>Player</th><th>Pos</th><th>Team</th>
               <th class="right">Avg</th>
               <th class="right">Total</th>
+              <th>Trend</th>
+              <th class="right">Boom/Bust</th>
+              <th>This Week</th>
               <th>Status</th>
             </tr>
           </thead>
           <tbody>
-            ${[...lineup.starters.filter(s => s.player).map(s => ({ ...s.player, slot: s.slot })), ...lineup.bench.map(p => ({ ...p, slot: 'BN' }))].map(p => `
+            ${[...lineup.starters.filter(s => s.player).map(s => ({ ...s.player, slot: s.slot })), ...lineup.bench.map(p => ({ ...p, slot: 'BN' }))].map(p => {
+              const line = realSeasonLine(p.player_id);
+              const advanced = getAdvancedPlayer(p.player_id);
+              const trendHeadline = getPlayerTrendHeadline(advanced?.trend);
+              const trendGamesPlayed = advanced?.radar?.games_played ?? advanced?.heatmap?.games_played ?? null;
+              const trendMinGames = advanced?.radar?.min_games ?? advanced?.heatmap?.min_games ?? null;
+              const volatility = advanced?.usage?.xfp_vol ?? null;
+              const trendCell = trendHeadline
+                ? `<span style="color: ${trendHeadline.direction === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${trendHeadline.direction === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[trendHeadline.feature]}</span>`
+                : `<span style="color: var(--text-muted); font-size: 11px;" title="${trendUnavailableText(trendGamesPlayed, trendMinGames)}">—</span>`;
+              const volatilityCell = volatility != null
+                ? `<span style="font-weight: 700;">${volatility.toFixed(1)}</span>`
+                : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+              return `
               <tr data-player-id="${p.player_id}">
                 <td><div class="player-row-name"><span>${p.name}</span>${p.injuryStatus ? `<span class="injury-badge ${p.injuryStatus}">${p.injuryStatus}</span>` : ''}</div></td>
                 <td><span class="pos-badge ${p.position}">${p.position}</span></td>
                 <td>${p.team}</td>
-                <td class="right">${p.seasonAvg.toFixed(1)}</td>
-                <td class="right">${p.totalPts.toFixed(1)}</td>
+                <td class="right">${line.games > 0 ? line.avg.toFixed(1) : '<span style="color: var(--text-muted); font-size: 11px;">—</span>'}</td>
+                <td class="right">${line.games > 0 ? line.total.toFixed(1) : '<span style="color: var(--text-muted); font-size: 11px;">—</span>'}</td>
+                <td>${trendCell}</td>
+                <td class="right">${volatilityCell}</td>
+                <td>${matchupIndicatorHtml(p.player_id, season, currentWeek)}</td>
                 <td style="font-size: 11px; color: var(--text-muted);">${p.slot === 'BN' ? 'Bench' : 'Starter'}</td>
               </tr>
-            `).join('')}
+            `;
+            }).join('')}
           </tbody>
         </table>
       </div>
     `;
 
-    // Render Chart.js
+    // Weekly Performance (points vs. opponent)
     const ctx = document.getElementById('td-chart');
     if (ctx && typeof Chart !== 'undefined') {
       chartInstances.team = new Chart(ctx, {
@@ -6540,6 +7089,59 @@
       });
     }
 
+    // Positional Scoring doughnut
+    const posCtx = document.getElementById('td-position-donut');
+    if (posCtx && typeof Chart !== 'undefined' && positionOrder.length) {
+      chartInstances.teamPosition = new Chart(posCtx, {
+        type: 'doughnut',
+        data: {
+          labels: positionOrder,
+          datasets: [{
+            data: positionOrder.map(p => positionTotals[p]),
+            backgroundColor: positionOrder.map(p => POSITION_COLORS[p]),
+            borderWidth: 0,
+          }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, cutout: '65%',
+          plugins: {
+            legend: { display: false },
+            tooltip: { callbacks: { label: (c) => `${c.label}: ${c.raw.toFixed(1)} pts` } },
+          },
+        },
+      });
+    }
+
+    // Season Trajectory line chart
+    const trajCtx = document.getElementById('td-trajectory-chart');
+    if (trajCtx && typeof Chart !== 'undefined') {
+      chartInstances.teamTrajectory = new Chart(trajCtx, {
+        type: 'line',
+        data: {
+          labels: trajectory.map(d => `Wk ${d.week}`),
+          datasets: [
+            {
+              label: team.teamName, data: trajectory.map(d => d.myCum),
+              borderColor: '#0891b2', backgroundColor: 'rgba(8, 145, 178, 0.08)',
+              borderWidth: 3, fill: true, tension: 0.2, pointRadius: 3,
+            },
+            {
+              label: 'League Avg', data: trajectory.map(d => d.leagueCum),
+              borderColor: '#94a3b8', borderWidth: 2, borderDash: [5, 5], fill: false, tension: 0.2, pointRadius: 0,
+            },
+          ],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { position: 'top', align: 'end', labels: { font: { size: 11 }, boxWidth: 12 } } },
+          scales: {
+            y: { ticks: { font: { size: 11 } }, grid: { color: '#f0f3f6' } },
+            x: { ticks: { font: { size: 11 } }, grid: { display: false } },
+          },
+        },
+      });
+    }
+
     document.getElementById('td-back').addEventListener('click', () => {
       state.activeTeamId = null;
       renderView();
@@ -6553,6 +7155,7 @@
     });
     main.querySelectorAll('.schedule-row').forEach(el => {
       el.addEventListener('click', () => {
+        if (el.dataset.played !== 'true') return; // no matchup detail for a week that hasn't happened
         state.selectedWeek = parseInt(el.dataset.week);
         const m = state.weeklyMatchups[state.selectedWeek].find(x => x.home === state.activeTeamId || x.away === state.activeTeamId);
         if (m) {
