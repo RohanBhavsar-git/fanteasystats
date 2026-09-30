@@ -3656,12 +3656,23 @@
   function matchupIndicatorHtml(playerId, season, week) {
     const m = getMatchup(playerId, season, week);
     if (!m || !m.opponent) return '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+    // Air-vulnerability is a WR/TE-specific derived signal (see its own
+    // caveat text) -- appended to the tooltip, not the compact badge
+    // itself, so it doesn't crowd a label already carrying icon/color/
+    // opponent for the position-specific rank. Only for the single
+    // upcoming `matchup` block (see assemble_player_advanced_stats' own
+    // comment) -- a past week read via weekly_matchup simply won't have it.
+    const position = state.playersById?.[playerId]?.position;
+    const av = m.air_vulnerability;
+    const airVulnTitle = (av && (position === 'WR' || position === 'TE'))
+      ? ` · Air vulnerability (derived stat, not measured): ${ordinal(av.rank)} of ${av.pool_size} most exploitable through the air`
+      : '';
     const fav = matchupFavorability(m.rank, m.pool_size);
     if (!fav) {
-      return `<span style="color: var(--text-muted); font-size: 11px;" title="No matchup rating for this position/week">vs ${m.opponent}</span>`;
+      return `<span style="color: var(--text-muted); font-size: 11px;" title="No matchup rating for this position/week${airVulnTitle}">vs ${m.opponent}</span>`;
     }
     return `
-      <span style="font-size: 12px; white-space: nowrap;" title="${fav.label} matchup vs ${m.opponent} — ranked ${m.rank} of ${m.pool_size} defenses allowed to this position (most-favorable-first)">
+      <span style="font-size: 12px; white-space: nowrap;" title="${fav.label} matchup vs ${m.opponent} — ranked ${m.rank} of ${m.pool_size} defenses allowed to this position (most-favorable-first)${airVulnTitle}">
         ${fav.icon} <span style="color: ${fav.color}; font-weight: 600;">vs ${m.opponent}</span>
       </span>
     `;
@@ -8829,6 +8840,45 @@
     return `https://a.espncdn.com/i/teamlogos/nfl/500/${(team || '').toLowerCase()}.png`;
   }
 
+  // Two crest sizes plus the original plain-dot fallback: a team whose logo
+  // hasn't loaded (still in flight, or the CDN request failed) draws at the
+  // OLD dot radius/color instead of a blank or broken image -- see
+  // getTeamLogoImage's onSettle, which re-renders this chart once each
+  // crest resolves so it can upgrade from dot to logo in place.
+  const TENDENCY_HALO_RADIUS = 13;
+  const TENDENCY_LOGO_RADIUS = 10;
+  const TENDENCY_DOT_RADIUS = 7;
+
+  // Cache of crest <img> elements for the scatter chart's point-style icons
+  // (Chart.js needs an already-loaded HTMLImageElement, not a URL string,
+  // to use as a per-point pointStyle) -- keyed by team so a re-render of
+  // this view (every navigation into it) doesn't re-request the same 32
+  // images. onSettle fires exactly once per team, the first time its image
+  // either loads or fails, so the caller can re-render to pick up crests
+  // that weren't ready yet on the first paint -- not on every later
+  // render, which would loop.
+  //
+  // width/height are set explicitly to the crest's ON-CHART pixel size --
+  // Chart.js draws an image pointStyle at the image's OWN width/height
+  // (ESPN serves these at 500x500), it does NOT scale it to pointRadius
+  // the way it does its own circle/triangle/etc. point styles. Without
+  // this, every crest rendered at full 500x500 resolution, blowing up the
+  // entire chart into an unreadable wall of overlapping logos (caught by
+  // screenshotting the real chart before shipping it).
+  const TEAM_LOGO_IMAGES = new Map();
+  function getTeamLogoImage(team, onSettle) {
+    let entry = TEAM_LOGO_IMAGES.get(team);
+    if (entry) return entry;
+    entry = { img: new Image(), ready: false, failed: false };
+    entry.img.width = TENDENCY_LOGO_RADIUS * 2;
+    entry.img.height = TENDENCY_LOGO_RADIUS * 2;
+    entry.img.onload = () => { entry.ready = true; onSettle && onSettle(); };
+    entry.img.onerror = () => { entry.failed = true; onSettle && onSettle(); };
+    entry.img.src = teamLogoUrl(team);
+    TEAM_LOGO_IMAGES.set(team, entry);
+    return entry;
+  }
+
   // Plain-language definitions for every Team Tendencies metric -- none of
   // these are self-explanatory on sight, and hover is the same place every
   // other caveat on this dashboard already lives (see tendencySparseBadge's
@@ -8843,6 +8893,7 @@
     rz10: "Same idea as RZ Pass% (≤20), restricted to inside the 10 -- the closest, most goal-line-specific plays, where an offense's real identity often shows up most clearly.",
     targetDist: "Share of this team's real targets going to running backs, wide receivers, and tight ends -- shows which position group this offense actually funnels its passing volume to.",
     airAllowed: "Share of this defense's real fantasy points allowed to RB/WR/TE that came through the air (receptions) rather than on the ground (carries). More useful than one blended points-allowed number -- two defenses can allow the same total while favoring completely different fantasy players.",
+    airVulnerability: "A derived statistical blend (air points allowed, WR/TE xFP allowed, and sacks, standardized against a 2023-2025 league-wide baseline) -- not a stat you'd see quoted elsewhere. Measures whether a defense is exploitable specifically through the air, separate from whether it's good or bad overall. Higher = more vulnerable = a better matchup for an opposing WR/TE.",
   };
 
   const TENDENCY_SORT_ACCESSORS = {
@@ -8852,6 +8903,7 @@
     rz20: t => t.red_zone.inside_20_pass_rate.s2d,
     rz10: t => t.red_zone.inside_10_pass_rate.s2d,
     airAllowed: t => tendencyAirShare(t.points_allowed),
+    airVulnerability: t => t.air_vulnerability?.score,
   };
 
   // Air share of real fantasy points allowed to RB/WR/TE -- air / (air +
@@ -8897,6 +8949,18 @@
   function renderTendenciesScatterChart(all) {
     const canvas = document.getElementById('tendencies-scatter');
     if (!canvas) return;
+    // A crest settling (loading or failing) after the first paint calls
+    // this function again directly -- outside the normal renderView() ->
+    // destroyCharts() cycle -- to upgrade that team from dot to logo in
+    // place. Without destroying the previous instance first, Chart.js
+    // refuses to reuse the canvas ("Canvas is already in use...") and
+    // throws instead of updating, which is exactly what happened before
+    // this guard existed: every crest finished loading, but the upgrade
+    // silently failed and the chart was stuck showing plain dots forever.
+    if (chartInstances.tendenciesScatter) {
+      chartInstances.tendenciesScatter.destroy();
+      chartInstances.tendenciesScatter = null;
+    }
     const entries = Object.entries(all).filter(
       ([, t]) => t.proe.s2d != null && t.plays_per_game.s2d != null
     );
@@ -8905,21 +8969,55 @@
     const playsValues = entries.map(([, t]) => t.plays_per_game.s2d).sort((a, b) => a - b);
     const playsMedian = playsValues[Math.floor(playsValues.length / 2)];
 
+    // trueX/trueY are what the tooltip reports -- x/y (below) get nudged
+    // apart in pixel space, after layout, purely so overlapping crests in
+    // a dense cluster don't sit on top of each other. The nudge only ever
+    // moves where a crest is DRAWN; it never changes the number reported
+    // for it.
     const points = entries.map(([team, t]) => {
       const q = tendencyQuadrant(t.proe.s2d, t.plays_per_game.s2d, playsMedian);
-      return { x: t.proe.s2d, y: t.plays_per_game.s2d, team, color: q.color };
+      const logo = getTeamLogoImage(team, () => {
+        if (state.currentView === 'tendencies' && !state.tendenciesSelectedTeam) renderTendenciesScatterChart(all);
+      });
+      return {
+        x: t.proe.s2d, y: t.plays_per_game.s2d,
+        trueX: t.proe.s2d, trueY: t.plays_per_game.s2d,
+        team, color: q.color, logo,
+      };
     });
 
+    // A team whose crest never loads (still in flight on first paint, or
+    // the CDN request failed) gets the OLD plain dot instead -- radius and
+    // color only, no image.
+    const haloRadii = points.map(p => (p.logo.ready ? TENDENCY_HALO_RADIUS : TENDENCY_DOT_RADIUS));
+
+    // The actual scatter dataset is fully invisible -- it exists only so
+    // Chart.js computes real x/y scales from the data and handles hit
+    // testing (hover/click/tooltip) the normal way. Every visible pixel
+    // (halo + crest) is instead drawn by the tendencyCrests plugin below,
+    // directly on the canvas. This is deliberate, not incidental: an
+    // earlier version used a second dataset with an image pointStyle for
+    // the crest, drawn "on top of" the halo dataset by array order -- two
+    // real Chart.js surprises turned up testing that against the live
+    // chart (caught by screenshotting it, not by reading the docs): (1)
+    // an image pointStyle draws at the image's OWN pixel dimensions,
+    // completely ignoring pointRadius -- ESPN serves these at 500x500, so
+    // the whole chart became a handful of giant overlapping logos; (2)
+    // dataset draw order didn't put the second dataset "on top" the way
+    // array order suggests, so even after fixing the size, the opaque
+    // halo dataset painted over every crest and only dots ever showed.
+    // Manual drawing in a plugin sidesteps both: this code controls
+    // exactly what gets drawn, at exactly what size, in exactly what
+    // order, with no dataset-stacking behavior to second-guess.
     chartInstances.tendenciesScatter = new Chart(canvas.getContext('2d'), {
       type: 'scatter',
       data: {
         datasets: [{
           data: points,
-          backgroundColor: points.map(p => p.color),
-          borderColor: 'rgba(255,255,255,0.7)',
-          borderWidth: 1.5,
-          pointRadius: 7,
-          pointHoverRadius: 9,
+          backgroundColor: 'transparent',
+          borderWidth: 0,
+          pointRadius: 0,
+          pointHitRadius: haloRadii.map(r => r + 2),
         }],
       },
       options: {
@@ -8941,7 +9039,7 @@
             callbacks: {
               label: (ctx) => {
                 const p = ctx.raw;
-                return `${p.team}: PROE ${p.x >= 0 ? '+' : ''}${p.x.toFixed(1)}, ${p.y.toFixed(1)} plays/gm`;
+                return `${p.team}: PROE ${p.trueX >= 0 ? '+' : ''}${p.trueX.toFixed(1)}, ${p.trueY.toFixed(1)} plays/gm`;
               },
             },
           },
@@ -8955,7 +9053,70 @@
           evt.native.target.style.cursor = elements.length ? 'pointer' : 'default';
         },
       },
+      plugins: [{
+        id: 'tendencyCrests',
+        afterDatasetsDraw(chart) {
+          const { ctx, scales } = chart;
+          points.forEach((p, i) => {
+            const x = scales.x.getPixelForValue(p.x);
+            const y = scales.y.getPixelForValue(p.y);
+            const haloR = haloRadii[i];
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(x, y, haloR, 0, Math.PI * 2);
+            ctx.fillStyle = p.color;
+            ctx.fill();
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+            ctx.stroke();
+            if (p.logo.ready) {
+              const r = TENDENCY_LOGO_RADIUS;
+              ctx.drawImage(p.logo.img, x - r, y - r, r * 2, r * 2);
+            }
+            ctx.restore();
+          });
+        },
+      }],
     });
+
+    // ---- Declutter pass -----------------------------------------------
+    // Runs AFTER Chart.js has laid out real scales, so it reads the actual
+    // pixel mapping instead of guessing at axis padding. Two teams with
+    // similar PROE and similar volume land close enough together that
+    // their crests would otherwise overlap into an unreadable blob (this
+    // league's own real spread has several such pairs -- e.g. two teams a
+    // couple tenths of a point apart on both axes). A few passes of simple
+    // pairwise repulsion push only the crests/halos that are actually too
+    // close, apart just enough to stop overlapping; everything else is
+    // untouched. trueX/trueY (what the tooltip reports) are never touched
+    // by this loop -- only x/y, the drawn position (read by the plugin
+    // above and by Chart.js's own hit-testing), move.
+    const chart = chartInstances.tendenciesScatter;
+    const xScale = chart.scales.x, yScale = chart.scales.y;
+    const px = points.map(p => ({
+      x: xScale.getPixelForValue(p.trueX),
+      y: yScale.getPixelForValue(p.trueY),
+    }));
+    for (let iter = 0; iter < 4; iter++) {
+      for (let i = 0; i < px.length; i++) {
+        for (let j = i + 1; j < px.length; j++) {
+          let dx = px[j].x - px[i].x, dy = px[j].y - px[i].y;
+          let dist = Math.hypot(dx, dy);
+          const minSep = haloRadii[i] + haloRadii[j] + 3;
+          if (dist >= minSep) continue;
+          if (dist < 0.01) { dx = minSep; dy = 0; dist = minSep; }
+          const push = (minSep - dist) / 2;
+          const ux = dx / dist, uy = dy / dist;
+          px[i].x -= ux * push; px[i].y -= uy * push;
+          px[j].x += ux * push; px[j].y += uy * push;
+        }
+      }
+    }
+    points.forEach((p, i) => {
+      p.x = xScale.getValueForPixel(px[i].x);
+      p.y = yScale.getValueForPixel(px[i].y);
+    });
+    chart.update('none');
   }
 
   function tendencyMetricCellHtml(block, decimals, suffix, scale) {
@@ -8983,6 +9144,15 @@
     return `<td class="right">${(share * 100).toFixed(0)}%</td>`;
   }
 
+  // Rank, not the raw score -- "4th of 32" reads plainly; a standardized
+  // blend value like "0.851" doesn't, and this is explicitly a derived
+  // statistical blend, not a stat with its own natural units (see
+  // TENDENCY_METRIC_TOOLTIPS.airVulnerability, surfaced on hover here).
+  function tendencyAirVulnerabilityCellHtml(av) {
+    if (!av) return '<td class="right" style="color: var(--text-muted);">—</td>';
+    return `<td class="right" title="${TENDENCY_METRIC_TOOLTIPS.airVulnerability}">${ordinal(av.rank)} of ${av.pool_size}</td>`;
+  }
+
   function tendencyTableRowHtml(team, t) {
     return `
       <tr data-team="${team}">
@@ -8994,6 +9164,7 @@
         ${tendencyMetricCellHtml(t.red_zone.inside_10_pass_rate, 0, '%', 100)}
         <td>${targetDistBarHtml(t.target_distribution)}</td>
         ${tendencyAirShareCellHtml(t.points_allowed)}
+        ${tendencyAirVulnerabilityCellHtml(t.air_vulnerability)}
       </tr>
     `;
   }
@@ -9041,7 +9212,7 @@
 
     const all = getAllTeamTendencies();
     const teams = Object.keys(all);
-    const sortLabel = { proe: 'PROE', pace: 'Pace', plays: 'Plays/Gm', rz20: 'RZ Pass% (≤20)', rz10: 'RZ Pass% (≤10)', airAllowed: 'Air Allowed %' };
+    const sortLabel = { proe: 'PROE', pace: 'Pace', plays: 'Plays/Gm', rz20: 'RZ Pass% (≤20)', rz10: 'RZ Pass% (≤10)', airAllowed: 'Air Allowed %', airVulnerability: 'Air Vulnerability' };
 
     main.innerHTML = `
       <div class="page-header-row">
@@ -9069,7 +9240,7 @@
         <div class="panel">
           <div class="panel-header">
             <div class="panel-title">All Teams</div>
-            <div class="panel-note">Sorted by ${sortLabel[state.tendenciesSortMetric] || 'PROE'} · click a row for detail · ~ marks a thin sample</div>
+            <div class="panel-note">Sorted by ${sortLabel[state.tendenciesSortMetric] || 'PROE'} · click a row for detail · ~ marks a thin sample · * is a derived statistical blend, not a measured stat</div>
           </div>
           <div style="overflow-x:auto;">
             <table class="players-table tendencies-table">
@@ -9082,6 +9253,7 @@
                 <th class="right" data-tendency-sort="rz10" title="${TENDENCY_METRIC_TOOLTIPS.rz10}">RZ Pass% (≤10)</th>
                 <th title="${TENDENCY_METRIC_TOOLTIPS.targetDist}">Target Distribution</th>
                 <th class="right" data-tendency-sort="airAllowed" title="${TENDENCY_METRIC_TOOLTIPS.airAllowed}">Air Allowed %</th>
+                <th class="right" data-tendency-sort="airVulnerability" title="${TENDENCY_METRIC_TOOLTIPS.airVulnerability}">Air Vulnerability*</th>
               </tr></thead>
               <tbody>
                 ${sortedTendencyEntries(all).map(([team, t]) => tendencyTableRowHtml(team, t)).join('')}
@@ -9142,9 +9314,12 @@
   // points-allowed number for "which of my players does this matchup
   // favor" -- a defense can allow the same total while being a run funnel
   // for one kind of player and a pass sieve for another.
-  function renderPointsAllowedPanelHtml(pointsAllowed) {
+  function renderPointsAllowedPanelHtml(pointsAllowed, airVulnerability) {
     const air = pointsAllowed?.air?.s2d;
     const ground = pointsAllowed?.ground?.s2d;
+    const airVulnHtml = airVulnerability
+      ? `<span class="tmv-sub" title="${TENDENCY_METRIC_TOOLTIPS.airVulnerability}">Air vulnerability (derived): ${ordinal(airVulnerability.rank)} of ${airVulnerability.pool_size} most exploitable</span>`
+      : '';
     if (air == null || ground == null) {
       return `
         <div class="panel" style="margin-bottom: 16px;">
@@ -9175,6 +9350,7 @@
           <div class="tendency-metric-values" style="align-self: center;">
             <span class="tmv-main">${air.toFixed(1)} <span style="font-size: 12px; color: var(--text-muted);">air xFP/gm</span></span>
             <span class="tmv-sub">${ground.toFixed(1)} ground xFP/gm</span>
+            ${airVulnHtml}
           </div>
         </div>
       </div>
@@ -9299,7 +9475,7 @@
         </div>
       </div>
 
-      ${renderPointsAllowedPanelHtml(t.points_allowed)}
+      ${renderPointsAllowedPanelHtml(t.points_allowed, t.air_vulnerability)}
 
       <div class="pd-placeholder-text" style="text-align: left; max-width: none;">
         ${teamTendencyCaveatText()}
