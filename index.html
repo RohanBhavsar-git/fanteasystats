@@ -2957,9 +2957,58 @@
       throw err;
     }
 
-    const currentWeek = league.settings?.leg || 1;
+    // This project's own model output -- the export matching the SELECTED
+    // season: the always-current live export, or a frozen archive
+    // (scripts/archive_season.py), per seasonOption.exportPath. Fetched
+    // here, earlier than the rest of this function's own data, because
+    // currentWeek below needs to know it. Not critical -- a missing/failed
+    // fetch leaves advancedStats null and "My Proj"/radar/heatmap
+    // correctly show as unavailable, same honesty as any other
+    // placeholder in this dashboard, rather than breaking the whole load.
+    const advancedStats = await fetchJSON(seasonOption.exportPath).catch(() => null);
+
+    // Sleeper's own `leg` is the league's current week, but the weekly
+    // export can run ahead of it: determine_target_week()
+    // (scripts/weekly_update.py) derives its target week from the NFL
+    // schedule's own completed-games count, a clock completely separate
+    // from Sleeper's leg. The two normally agree; when they don't (leg
+    // hasn't advanced yet but the model has already predicted the next
+    // week), the export is the authority on which week actually has model
+    // output, so the dashboard should default there -- otherwise My Proj/
+    // simulation/Monte Carlo guard themselves right back to null for a
+    // week mismatch nobody looking at the screen can see.
+    //
+    // Archived seasons are exempt: an archive's meta.week is its final,
+    // PLAYOFF-INCLUSIVE week (e.g. 19), always >= its leg (regular season
+    // only, e.g. 17) -- applying max() there would silently extend an
+    // already-complete season's navigable weeks into playoff weeks this
+    // dashboard shows via the brackets view, not this week-by-week nav.
+    const leg = league.settings?.leg || 1;
+    let currentWeek = leg;
+    if (seasonOption.live && advancedStats && Number(advancedStats.meta?.season) === season) {
+      const metaWeek = Number(advancedStats.meta?.week);
+      if (metaWeek > 0) currentWeek = Math.max(leg, metaWeek);
+    }
+
+    // Beyond currentWeek, Sleeper still has real value to show: full-season
+    // matchup pairings and Sleeper's own per-week projections are published
+    // in advance (verified directly against Sleeper's API for a week deep
+    // into the season), and the standings panel doesn't depend on selected
+    // week at all. Only this pipeline's own numbers -- My Proj, Monte
+    // Carlo, simulation win probability/playoff odds, opponent-adjusted
+    // matchup rank -- are capped at meta.week, and weekCoverageNoticeHtml()
+    // says so plainly rather than leaving them to read blank as if broken.
+    // Regular season only (through playoff_week_start - 1): playoff weeks
+    // are shown via the winners/losers bracket view, and Sleeper's
+    // matchup_id pairing during playoffs doesn't mean the same thing once
+    // some teams are already eliminated, so this week-by-week nav doesn't
+    // extend there. Archived seasons are unaffected -- lastNavigableWeek
+    // just equals currentWeek (== leg) for them, same as before.
+    const lastNavigableWeek = seasonOption.live
+      ? Math.max(currentWeek, (league.settings?.playoff_week_start || currentWeek + 1) - 1)
+      : currentWeek;
     const availableWeeks = [];
-    for (let w = 1; w <= currentWeek; w++) availableWeeks.push(w);
+    for (let w = 1; w <= lastNavigableWeek; w++) availableWeeks.push(w);
 
     // Step 2: Fetch matchups for the visible weeks
     const matchupsByWeek = {};
@@ -3068,15 +3117,6 @@
     // Compute biggest blowout (across all matchups of the season)
     const blowout = computeBiggestBlowout(matchupsByWeek);
 
-    // Step 7: This project's own model output -- the export matching the
-    // SELECTED season: the always-current live export, or a frozen
-    // archive (scripts/archive_season.py), per seasonOption.exportPath.
-    // Not critical -- a missing/failed fetch leaves advancedStats null and
-    // "My Proj"/radar/heatmap correctly show as unavailable, same honesty
-    // as any other placeholder in this dashboard, rather than breaking
-    // the whole load.
-    const advancedStats = await fetchJSON(seasonOption.exportPath).catch(() => null);
-
     return {
       league,
       users,
@@ -3122,6 +3162,24 @@
       return null;
     }
     return advanced.players?.[playerId]?.projection || null;
+  }
+
+  // Why a given My Proj cell is blank -- distinguishes "the export never
+  // loaded" from "it loaded, but for a different week than the one on
+  // screen" (by far the common case: getMyProj's own guard above is what
+  // usually nulls it out, not a missing file). These used to share one
+  // "Custom model not loaded" title regardless of which was true.
+  function myProjUnavailableTitle(season, week) {
+    const advanced = state.advancedStats;
+    if (!advanced) return 'Custom model output not loaded';
+    if (Number(advanced.meta?.season) !== Number(season)) {
+      return "Custom model output is for a different season than the one you're viewing";
+    }
+    const metaWeek = Number(advanced.meta?.week);
+    if (metaWeek !== Number(week)) {
+      return `Custom model is loaded, but only covers Week ${metaWeek} right now -- not Week ${week}`;
+    }
+    return 'No projection for this player';
   }
 
   // Monte Carlo block (boom/bust/thresholds/quantiles/game_id) is a
@@ -3352,6 +3410,22 @@
       }
     });
     return best;
+  }
+
+  // Same "why is this blank" context the Dashboard's Usage Trending panel
+  // already gives ("Usage trends need at least 5 games played this season
+  // and populate from Week 6 onward") -- reused everywhere else a null
+  // per-player trend would otherwise read as broken instead of "not
+  // enough games yet". gamesPlayed/minGames come from the export's own
+  // radar block (heatmap carries the identical pair) since the trend
+  // block itself doesn't repeat games_played per signal.
+  function trendUnavailableText(gamesPlayed, minGames) {
+    const min = minGames || 5;
+    if (gamesPlayed == null) return 'No usage trend for this player';
+    if (gamesPlayed >= min) {
+      return "No usage trend right now -- nothing moving meaningfully off this player's own baseline";
+    }
+    return `Usage trends need ${min} games played this season -- this player is at ${gamesPlayed}`;
   }
 
   // Combined usage-trend leaderboard across every player the export
@@ -3930,7 +4004,10 @@
            <span style="color: ${trendHeadline.direction === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 700;">${trendHeadline.direction === 'rising' ? '↑' : '↓'}</span>
            <span>${TREND_FEATURE_LABELS[trendHeadline.feature]} ${trendHeadline.direction}</span>
          </div>`
-      : `<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">No usage trend yet this season</div>`;
+      : `<div style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">${trendUnavailableText(
+          advanced.radar?.games_played ?? advanced.heatmap?.games_played,
+          advanced.radar?.min_games ?? advanced.heatmap?.min_games
+        )}</div>`;
 
     // Family 5B matchup line -- how this week's real opponent rates
     // against this player's own position, opponent-adjusted. Gated on
@@ -4630,6 +4707,33 @@
     if (!sim) return false;
     if (Number(advanced.meta?.season) !== Number(state.league?.season)) return false;
     return sim.week === state.selectedWeek;
+  }
+
+  // Plain statement of what's actually missing when browsing a week past
+  // the export's own meta.week -- getAvailableWeeks() now lets a live
+  // season navigate into weeks the model hasn't predicted yet (Sleeper
+  // publishes the full season's matchup pairings and its own projections
+  // up front, so those still work; see fetchAllRealData's own comment on
+  // lastNavigableWeek). Without this, My Proj/Monte Carlo/win probability/
+  // playoff odds/opponent-adjusted matchup rank would all just read blank
+  // with no explanation, which is exactly the "reads as broken when it
+  // isn't" problem getMyProj's own guard was trying to avoid causing in
+  // the first place. Returns '' (nothing to show) for an archived season,
+  // a season mismatch, or any week the export already covers.
+  function weekCoverageNoticeHtml() {
+    const advanced = state.advancedStats;
+    if (!advanced || Number(advanced.meta?.season) !== Number(state.league?.season)) return '';
+    const metaWeek = Number(advanced.meta?.week);
+    if (!metaWeek || state.selectedWeek <= metaWeek) return '';
+    return `
+      <div class="info-banner" style="margin-bottom: 16px;">
+        <span>📡 <strong>Week ${state.selectedWeek}</strong> is past this dashboard's own model coverage --
+        the pipeline predicts one week at a time, and the most recent run covers through
+        <strong>Week ${metaWeek}</strong>. Matchup pairings, Sleeper's own projections, and standings below are
+        still real. My Proj, floor/ceiling, boom/bust odds, win probability, and playoff odds will pick back up
+        once Week ${state.selectedWeek} becomes the model's target week.</span>
+      </div>
+    `;
   }
 
   // {home: pct, away: pct} for one matchup, or null. Only returns a value
@@ -5677,11 +5781,16 @@
           <button class="week-btn" id="next-week" ${!canNext ? 'disabled' : ''}>›</button>
         </div>
       </div>
+      ${weekCoverageNoticeHtml()}
       <div class="dashboard-grid">
         <div class="panel">
           <div class="panel-header">
             <div class="panel-title">Week ${state.selectedWeek} Matchups</div>
-            <div class="panel-note">${matchups.length} games${state.selectedWeek === getCurrentWeek() ? ' · Live' : ' · Final'}</div>
+            <div class="panel-note">${matchups.length} games${
+              state.selectedWeek === getCurrentWeek() ? ' · Live'
+              : state.selectedWeek > getCurrentWeek() ? ' · Upcoming'
+              : ' · Final'
+            }</div>
           </div>
           <div class="matchup-list">
             ${matchups.map(m => {
@@ -5926,6 +6035,7 @@
           <button class="week-btn" id="next-week" ${!canNext ? 'disabled' : ''}>›</button>
         </div>
       </div>
+      ${weekCoverageNoticeHtml()}
       <div class="matchups-grid">
         ${matchups.map(m => {
           const homeWin = m.homePts > m.awayPts;
@@ -6659,6 +6769,8 @@
         p.trendSignal = trendHeadline?.signal ?? null;
         p.trendDirection = trendHeadline?.direction ?? null;
         p.trendFeature = trendHeadline?.feature ?? null;
+        p.trendGamesPlayed = advanced?.radar?.games_played ?? advanced?.heatmap?.games_played ?? null;
+        p.trendMinGames = advanced?.radar?.min_games ?? advanced?.heatmap?.min_games ?? null;
         p.fpOverExp = advanced?.xfp?.fp_over_expected ?? null;
         p.volatility = advanced?.usage?.xfp_vol ?? null;
 
@@ -6696,10 +6808,10 @@
             (p.myProjFloor != null && p.myProjCeiling != null
               ? `<div style="font-size: 10px; color: var(--text-muted);">${p.myProjFloor.toFixed(1)}–${p.myProjCeiling.toFixed(1)}</div>`
               : '')
-          : '<span style="color: var(--text-muted); font-size: 11px;" title="Custom model not loaded">—</span>';
+          : `<span style="color: var(--text-muted); font-size: 11px;" title="${myProjUnavailableTitle(season, playerWeek)}">—</span>`;
         const trendCell = p.trendDirection
           ? `<span style="color: ${p.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${p.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[p.trendFeature]}</span>`
-          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+          : `<span style="color: var(--text-muted); font-size: 11px;" title="${trendUnavailableText(p.trendGamesPlayed, p.trendMinGames)}">—</span>`;
         // QB's fp_over_expected strips out meaningfully less luck than
         // RB/WR/TE's does (split-half check: 0.37 vs. 0.19 residual
         // correlation -- see PROJECT_CONTEXT.md's QB xFP findings), so
@@ -7585,7 +7697,7 @@
               ${compared.map(p => {
                 const stats = playerStats[p.player_id];
                 const v = stats.myProj;
-                if (v == null) return '<td class="numeric na" title="Custom model not loaded">—</td>';
+                if (v == null) return `<td class="numeric na" title="${myProjUnavailableTitle(season, compareWeek)}">—</td>`;
                 const range = stats.myProjFloor != null && stats.myProjCeiling != null
                   ? `<div style="font-size: 10px; color: var(--text-muted); font-weight: 400;">${stats.myProjFloor.toFixed(1)}–${stats.myProjCeiling.toFixed(1)}</div>`
                   : '';
@@ -7750,7 +7862,7 @@
             (p.myProjFloor != null && p.myProjCeiling != null
               ? `<div style="font-size: 10px; color: var(--text-muted);">${p.myProjFloor.toFixed(1)}–${p.myProjCeiling.toFixed(1)}</div>`
               : '')
-          : '<span style="color: var(--text-muted); font-size: 11px;" title="Custom model not loaded">—</span>';
+          : `<span style="color: var(--text-muted); font-size: 11px;" title="${myProjUnavailableTitle(season, compareWeek)}">—</span>`;
         return `
           <tr>
             <td>
@@ -8065,6 +8177,7 @@
         teamChanged,
         seasonPts: pd.xfp?.season_actual ?? null,
         gamesPlayed: pd.radar?.games_played ?? pd.heatmap?.games_played ?? null,
+        minGames: pd.radar?.min_games ?? pd.heatmap?.min_games ?? null,
         fpOverExp: pd.xfp?.fp_over_expected ?? null,
         volatility: pd.usage?.xfp_vol ?? null,
         volumePct: volumeAxis?.percentile ?? null,
@@ -8186,7 +8299,7 @@
           : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
         const trendCell = r.trendDirection
           ? `<span style="color: ${r.trendDirection === 'rising' ? 'var(--success)' : 'var(--danger)'}; font-weight: 600; font-size: 12px; white-space: nowrap;">${r.trendDirection === 'rising' ? '↑' : '↓'} ${TREND_FEATURE_LABELS[r.trendFeature]}</span>`
-          : '<span style="color: var(--text-muted); font-size: 11px;">—</span>';
+          : `<span style="color: var(--text-muted); font-size: 11px;" title="${trendUnavailableText(r.gamesPlayed, r.minGames)}">—</span>`;
         return `
           <tr data-player-id="${r.playerId}">
             <td>
