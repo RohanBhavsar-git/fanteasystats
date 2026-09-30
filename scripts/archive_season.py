@@ -49,8 +49,9 @@ import pandas as pd  # noqa: E402
 
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
-    CAVEATS, assemble_player_advanced_stats, build_defense_stats_export, build_heatmap_snapshot,
-    build_kicker_stats_export, build_radar_snapshot, build_season_defense_rankings, build_season_team_tendencies,
+    CAVEATS, assemble_player_advanced_stats, attach_air_vulnerability, build_defense_stats_export,
+    build_heatmap_snapshot, build_kicker_stats_export, build_radar_snapshot, build_season_air_vulnerability_rankings,
+    build_season_defense_rankings, build_season_team_tendencies,
     build_target_week_features, build_trend_snapshot, build_usage_snapshot, build_weekly_matchup, build_weekly_xfp,
     build_xfp_summary, get_archive_candidates, get_export_scope, get_season_team_map, merge_kicker_and_defense_entries,
     predict_target_week_from_artifact, validate_export,
@@ -195,6 +196,17 @@ def main() -> None:
     )
     print(f"    team tendencies: {len(team_tendencies)}/32 teams")
 
+    # Air-vulnerability index (PROJECT_CONTEXT.md's "Team-tendency PCA" --
+    # the one component of six that survived). Reuses defense_rankings'/
+    # team_tendencies' own already-computed WR/TE/air-allowed numbers
+    # rather than recomputing them; sacks is the one new input, computed
+    # directly from pbp_season to stay in nflverse's own team-code space
+    # throughout (see build_season_air_vulnerability_rankings' own
+    # docstring for why that matters for the Rams specifically).
+    air_vulnerability = build_season_air_vulnerability_rankings(defense_rankings, team_tendencies, pbp_season, season)
+    attach_air_vulnerability(team_tendencies, air_vulnerability)
+    print(f"    air vulnerability: {len(air_vulnerability)}/{len(team_tendencies)} teams ranked")
+
     # K and DEF are out of scope for the projection model (see CLAUDE.md's
     # scope boundaries) and never appear in weekly_features/candidates at
     # all (FANTASY_POSITIONS excludes both), so this is a real, separate
@@ -228,6 +240,7 @@ def main() -> None:
         defense_rankings=defense_rankings,
         weekly_matchup=weekly_matchup,
         team_tendencies=team_tendencies,
+        air_vulnerability=air_vulnerability,
     )
     payload["simulation"] = None  # a hypothetical post-season week has no real matchups to simulate
     payload = merge_kicker_and_defense_entries(payload, kicker_export, defense_export)

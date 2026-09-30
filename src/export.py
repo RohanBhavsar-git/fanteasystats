@@ -1102,6 +1102,178 @@ def build_season_team_tendencies(
     return out
 
 
+# ==========================================================================
+# AIR-VULNERABILITY INDEX -- a derived, PCA-informed defense signal
+# ==========================================================================
+# Explored via an offline PCA on 96 real team-seasons (2023-2025 archives,
+# 8 z-scored defense inputs, components reported before any UI was built --
+# see PROJECT_CONTEXT.md's "Team-tendency PCA" section for the full
+# writeup). Five of six components examined (both offense and defense)
+# reduced to either one existing column or a hand-computable combination of
+# two and were dropped. This is the one that survived: PC2 separates "this
+# defense is vulnerable specifically THROUGH THE AIR" from "this defense is
+# just bad overall" (that generic-quality read was PC1, dropped) -- its
+# best single-stat correlation was r=0.75 (points allowed via the air), so
+# it isn't one column wearing a new name.
+#
+# This is a STATISTICAL BLEND, not a stat a broadcast would quote --
+# AIR_VULNERABILITY_CAVEAT says so everywhere this is shown.
+#
+# Weights are PC2's own loadings for exactly these four (of its original
+# eight) inputs, re-normalized to sum to 1 in absolute value so they read
+# as a plain weighted average of standardized inputs rather than an
+# arbitrary-looking vector.
+AIR_VULNERABILITY_WEIGHTS = {
+    "points_allowed_air_pg": 0.3298,
+    "xfp_allowed_wr": 0.2362,
+    "xfp_allowed_te": 0.2345,
+    "sacks_pg": -0.1995,
+}
+
+# Frozen z-scoring reference -- population mean/std (ddof=0, matching
+# sklearn's StandardScaler) for each raw input, computed once from the same
+# 96 pooled 2023-2025 team-seasons the PCA itself used. Frozen rather than
+# refit against whatever's in-season right now: early in a season there
+# are only a handful of team-weeks to standardize against, which would make
+# the SAME defense's index swing wildly week to week for no real reason --
+# anchoring to a large, stable, real historical baseline keeps the units
+# comparable across weeks AND across seasons, the same reason the PCA
+# itself pooled seasons rather than standardizing each one separately.
+AIR_VULNERABILITY_REFERENCE = {
+    "points_allowed_air_pg": (41.8458, 3.4514),
+    "xfp_allowed_wr": (26.8538, 2.9552),
+    "xfp_allowed_te": (9.4614, 1.3683),
+    "sacks_pg": (2.4577, 0.4837),
+}
+
+AIR_VULNERABILITY_CAVEAT = (
+    "A derived statistical blend (air points allowed, WR/TE xFP allowed, and sacks, z-scored "
+    "against a 2023-2025 league-wide baseline) -- not a stat you'd see quoted elsewhere. It measures "
+    "whether a defense is exploitable specifically THROUGH THE AIR, separate from whether it's good "
+    "or bad overall. Higher means more vulnerable -- a better matchup for an opposing receiver/tight end."
+)
+
+
+def _air_vulnerability_score(air_pg, xfp_wr, xfp_te, sacks_pg) -> float | None:
+    """
+    One team's raw air-vulnerability score: a weighted sum of z-scores
+    (against AIR_VULNERABILITY_REFERENCE, weighted by AIR_VULNERABILITY_
+    WEIGHTS). Higher = more vulnerable through the air. None if any input
+    is missing -- a partial blend would silently be a different,
+    undocumented formula, not this one.
+    """
+    values = {"points_allowed_air_pg": air_pg, "xfp_allowed_wr": xfp_wr, "xfp_allowed_te": xfp_te, "sacks_pg": sacks_pg}
+    if any(pd.isna(v) for v in values.values()):
+        return None
+    score = 0.0
+    for key, weight in AIR_VULNERABILITY_WEIGHTS.items():
+        mean, std = AIR_VULNERABILITY_REFERENCE[key]
+        score += weight * (values[key] - mean) / std
+    return score
+
+
+def _rank_air_vulnerability(scores: dict) -> dict:
+    """
+    {team: score} -> {team: {"score", "rank", "pool_size"}}, most
+    vulnerable (highest score) ranked first -- same "most favorable to
+    face first" direction build_defense_rankings already uses. A team with
+    a None score (incomplete inputs) is simply absent, same convention as
+    build_defense_rankings.
+    """
+    real = {t: s for t, s in scores.items() if s is not None}
+    ranked = sorted(real.items(), key=lambda kv: kv[1], reverse=True)
+    pool_size = len(ranked)
+    return {
+        team: {"score": round(score, 3), "rank": rank, "pool_size": pool_size}
+        for rank, (team, score) in enumerate(ranked, start=1)
+    }
+
+
+def build_air_vulnerability_rankings(
+    defense_rankings: dict, team_tendencies: dict, sack_rate: pd.DataFrame,
+    target_season: int, target_week: int,
+) -> dict:
+    """
+    LIVE (point-in-time) air-vulnerability rankings -- reuses build_defense_
+    rankings' own WR/TE raw_s2d and build_team_tendencies' own points_
+    allowed.air.s2d (both already point-in-time-safe as of target_week)
+    rather than re-deriving their inputs a second time, plus a fresh
+    build_defense_sack_rate reading for the same week. Returns {team:
+    {"score", "rank", "pool_size"}}; a team missing any one of the four
+    inputs (not enough prior games yet) is simply absent.
+
+    Args:
+        defense_rankings: build_defense_rankings' output for this exact
+            target_season/target_week.
+        team_tendencies: build_team_tendencies' output for the same week.
+        sack_rate: build_defense_sack_rate's output (covers every week --
+            filtered here to target_season/target_week).
+    """
+    wr_by_team = {e["team"]: e["raw_s2d"] for e in defense_rankings.get("WR", [])}
+    te_by_team = {e["team"]: e["raw_s2d"] for e in defense_rankings.get("TE", [])}
+    week_sacks = sack_rate[(sack_rate["season"] == target_season) & (sack_rate["week"] == target_week)]
+    sacks_by_team = dict(zip(week_sacks["team"], week_sacks["sacks_per_game_s2d"]))
+
+    scores = {}
+    for team, t in team_tendencies.items():
+        air_allowed = (t.get("points_allowed") or {}).get("air", {}).get("s2d")
+        scores[team] = _air_vulnerability_score(
+            air_allowed, wr_by_team.get(team), te_by_team.get(team), sacks_by_team.get(team)
+        )
+    return _rank_air_vulnerability(scores)
+
+
+def build_season_air_vulnerability_rankings(defense_rankings: dict, team_tendencies: dict, pbp: pd.DataFrame, season: int) -> dict:
+    """
+    Season-ARCHIVE counterpart to build_air_vulnerability_rankings -- same
+    composite, reusing build_season_defense_rankings' own WR/TE raw_s2d
+    and build_season_team_tendencies' own points_allowed.air.s2d (both
+    already real, whole-season retrospective numbers), plus a whole-season
+    sacks-per-game computed directly here from pbp.
+
+    Deliberately NOT reusing kicker_defense.py's build_defense_season_
+    stats for the sacks input, even though it already computes a season
+    sack total: that function's output is re-keyed to SLEEPER's team codes
+    before export (see NFLVERSE_TO_SLEEPER_TEAM's own comment -- Sleeper
+    says "LAR", nflverse says "LA"), while defense_rankings/team_tendencies
+    stay in nflverse's own code space throughout. Recomputing sacks
+    directly from pbp here keeps every input to this function in that same
+    nflverse space, so this join never needs to cross that boundary at all
+    -- exactly the kind of silent-drop-for-one-team risk that boundary
+    creates if two nflverse-keyed and Sleeper-keyed sources get joined by
+    team code without converting first.
+    """
+    reg_pbp = pbp[(pbp["season_type"] == "REG") & (pbp["season"] == season)]
+    games_played = reg_pbp.groupby("defteam")["game_id"].nunique()
+    sacks_total = reg_pbp.groupby("defteam")["sack"].sum()
+    sacks_pg = (sacks_total / games_played).to_dict()
+
+    wr_by_team = {e["team"]: e["raw_s2d"] for e in defense_rankings.get("WR", [])}
+    te_by_team = {e["team"]: e["raw_s2d"] for e in defense_rankings.get("TE", [])}
+
+    scores = {}
+    for team, t in team_tendencies.items():
+        air_allowed = (t.get("points_allowed") or {}).get("air", {}).get("s2d")
+        scores[team] = _air_vulnerability_score(
+            air_allowed, wr_by_team.get(team), te_by_team.get(team), sacks_pg.get(team)
+        )
+    return _rank_air_vulnerability(scores)
+
+
+def attach_air_vulnerability(team_tendencies: dict, air_vulnerability: dict) -> dict:
+    """
+    Merges build_air_vulnerability_rankings'/build_season_air_vulnerability_
+    rankings' output into each team's own team_tendencies entry under a new
+    "air_vulnerability" key ({"score", "rank", "pool_size"}, or None for a
+    team air_vulnerability has no complete-inputs entry for). Mutates and
+    returns team_tendencies for convenience -- same pattern merge_kicker_
+    and_defense_entries already uses for payload["players"].
+    """
+    for team, block in team_tendencies.items():
+        block["air_vulnerability"] = air_vulnerability.get(team)
+    return team_tendencies
+
+
 def build_radar_snapshot(
     combined_features: pd.DataFrame,
     target_season: int,
@@ -1512,6 +1684,7 @@ def assemble_player_advanced_stats(
     defense_rankings: dict | None = None,
     weekly_matchup: pd.DataFrame | None = None,
     team_tendencies: dict | None = None,
+    air_vulnerability: dict | None = None,
 ) -> tuple[dict, dict]:
     """
     Joins everything onto scoped_predictions and crosswalks gsis_id ->
@@ -1593,6 +1766,12 @@ def assemble_player_advanced_stats(
     (sibling to `players`), for the dashboard's standalone "which defenses
     are favorable this week" panel, which needs the whole league, not one
     player's opponent.
+
+    `air_vulnerability` (build_air_vulnerability_rankings's or build_
+    season_air_vulnerability_rankings's output) rides along inside the
+    same `matchup` block, looked up by opponent exactly like defense_
+    rankings' rank/pool_size just above -- not position-specific, so no
+    (position, team) tuple needed, just a plain {team: {...}} lookup.
 
     `weekly_matchup` (build_weekly_matchup's output) is grouped into
     {player_id: {week_str: matchup_dict}} the same way `weekly_xfp` is --
@@ -1743,6 +1922,7 @@ def assemble_player_advanced_stats(
                         else round(float(row["opp_def_xfp_allowed_adj_s2d"]), 2)
                     ),
                     **(rank_lookup.get((row["position"], row["opponent"])) or {"rank": None, "pool_size": None}),
+                    "air_vulnerability": (air_vulnerability or {}).get(row["opponent"]),
                 }
             ),
         }
@@ -1760,6 +1940,7 @@ def assemble_player_advanced_stats(
             "monte_carlo_caveat": MONTE_CARLO_CALIBRATION_CAVEAT,
             "monte_carlo_n_sims": SIMULATION_N_SIMS_MATCHUP,
             "team_tendency_caveat": TEAM_TENDENCY_CAVEAT,
+            "air_vulnerability_caveat": AIR_VULNERABILITY_CAVEAT,
         },
         "players": players,
         "defense_rankings": defense_rankings,
@@ -1999,6 +2180,16 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         f"team_tendencies has a share outside [0, 1] for: {bad_team_tendency_shares[:5]}"
     )
 
+    bad_air_vulnerability = [
+        team for team, block in team_tendencies.items()
+        if block.get("air_vulnerability")
+        and not (1 <= block["air_vulnerability"]["rank"] <= block["air_vulnerability"]["pool_size"])
+    ]
+    assert not bad_air_vulnerability, (
+        f"team_tendencies has an air_vulnerability rank outside [1, pool_size] for: {bad_air_vulnerability[:5]}"
+    )
+    n_air_vulnerability = sum(1 for block in team_tendencies.values() if block.get("air_vulnerability"))
+
     # K/DEF entries -- rates (pat_rate, fg_rate_*) must be within [0, 1]
     # where present (null is fine -- a zero-attempt band); games_played
     # must be non-negative. No radar/heatmap/monte_carlo/matchup checks
@@ -2038,6 +2229,8 @@ def validate_export(payload: dict, crosswalk: pd.DataFrame) -> dict:
         "defense_rankings_positions": list(defense_rankings.keys()),
         "n_team_tendencies": len(team_tendencies),
         "team_tendency_shares_in_range": True,
+        "n_air_vulnerability": n_air_vulnerability,
+        "air_vulnerability_ranks_valid": True,
         "n_kicker_stats": len(kicker_entries),
         "kicker_rates_in_range": True,
         "n_defense_stats": len(defense_entries),

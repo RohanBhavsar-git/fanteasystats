@@ -16,6 +16,8 @@ import src.export as export_module  # noqa: E402
 from src.export import (  # noqa: E402
     assemble_player_advanced_stats,
     assemble_simulation_block,
+    attach_air_vulnerability,
+    build_air_vulnerability_rankings,
     build_defense_rankings,
     build_defense_stats_export,
     build_heatmap_snapshot,
@@ -25,6 +27,7 @@ from src.export import (  # noqa: E402
     build_playoff_odds,
     build_player_simulation_metrics,
     build_radar_snapshot,
+    build_season_air_vulnerability_rankings,
     build_season_defense_rankings,
     build_starter_quantile_rows,
     build_target_week_features,
@@ -38,16 +41,42 @@ from src.export import (  # noqa: E402
     get_export_scope,
     get_season_team_map,
     merge_kicker_and_defense_entries,
+    NFLVERSE_TO_SLEEPER_TEAM,
     normalize_team_code,
     position_starter_counts,
     validate_export,
     validate_simulation,
+    _air_vulnerability_score,
+    _rank_air_vulnerability,
 )
 
 
 def test_normalize_team_code_maps_lar_to_la_and_passes_others_through():
     assert normalize_team_code("LAR") == "LA"
     assert normalize_team_code("KC") == "KC"
+
+
+def test_build_defense_stats_export_converts_rams_la_to_sleeper_lar():
+    """
+    Regression test for a real, previously-uncovered gap: every existing
+    build_defense_stats_export test used a team code identical in both
+    conventions (KC), so the one team this actually matters for (the
+    Rams -- nflverse says "LA", Sleeper says "LAR", see NFLVERSE_TO_
+    SLEEPER_TEAM's own comment) was never exercised. A caller who joins
+    team_tendencies/defense_rankings (nflverse's "LA") against defense_
+    stats/players (Sleeper's "LAR") by team code without converting first
+    silently drops the Rams -- this is exactly what build_air_
+    vulnerability_rankings below avoids by never crossing that boundary.
+    """
+    defense_stats = pd.DataFrame({
+        "team": ["LA"], "games_played": [10], "sacks": [25.0], "interceptions": [8.0],
+        "pass_yards_allowed_per_game": [210.0], "rush_yards_allowed_per_game": [100.0],
+        "points_allowed_per_game": [20.0],
+    })
+    out = build_defense_stats_export(defense_stats)
+    assert set(out.keys()) == {"LAR"}
+    assert out["LAR"]["team"] == "LAR"
+    assert NFLVERSE_TO_SLEEPER_TEAM["LA"] == "LAR"
 
 
 def test_get_export_candidates_starts_from_history_and_reports_real_match_rate():
@@ -461,6 +490,79 @@ def test_build_defense_rankings_ranks_most_favorable_first_and_omits_thin_teams(
     assert [row["rank"] for row in result["WR"]] == [1, 2]
     assert result["WR"][0]["adj_s2d"] == pytest.approx(27.0)
     assert result["WR"][0]["raw_ewm3"] == pytest.approx(30.0)
+
+
+# ==========================================================================
+# AIR-VULNERABILITY INDEX (derived from the offline PCA -- see
+# PROJECT_CONTEXT.md's "Team-tendency PCA" section)
+# ==========================================================================
+def test_air_vulnerability_score_is_none_when_any_input_is_missing():
+    """A partial blend would silently be a different, undocumented
+    formula -- every one of the four inputs must be real."""
+    assert _air_vulnerability_score(40.0, 27.0, 9.0, 2.5) is not None
+    assert _air_vulnerability_score(None, 27.0, 9.0, 2.5) is None
+    assert _air_vulnerability_score(40.0, None, 9.0, 2.5) is None
+    assert _air_vulnerability_score(40.0, 27.0, float("nan"), 2.5) is None
+
+
+def test_air_vulnerability_score_direction_matches_pc2s_own_sign():
+    """More air points allowed and more WR/TE xFP allowed should raise
+    the score (more vulnerable); more sacks should lower it (a real pass
+    rush suppresses exploitability) -- PC2's own loading signs, not an
+    arbitrary convention."""
+    baseline = _air_vulnerability_score(41.85, 26.85, 9.46, 2.46)  # ~ the frozen reference means
+    more_air = _air_vulnerability_score(55.0, 26.85, 9.46, 2.46)
+    more_sacks = _air_vulnerability_score(41.85, 26.85, 9.46, 5.0)
+    assert more_air > baseline
+    assert more_sacks < baseline
+
+
+def test_rank_air_vulnerability_ranks_highest_score_first_and_omits_none():
+    scores = {"AAA": 1.5, "BBB": -0.5, "CCC": None, "DDD": 0.2}
+    result = _rank_air_vulnerability(scores)
+    assert set(result.keys()) == {"AAA", "BBB", "DDD"}  # CCC (no complete inputs) is absent
+    assert result["AAA"]["rank"] == 1
+    assert result["DDD"]["rank"] == 2
+    assert result["BBB"]["rank"] == 3
+    assert result["AAA"]["pool_size"] == result["BBB"]["pool_size"] == 3
+
+
+def test_build_air_vulnerability_rankings_combines_the_three_sources_by_team():
+    """
+    Isolates build_air_vulnerability_rankings' own plumbing -- reading WR/
+    TE raw_s2d out of a defense_rankings-shaped dict, air.s2d out of a
+    team_tendencies-shaped dict, and sacks out of a build_defense_sack_
+    rate-shaped frame -- with small, fully-controlled inputs rather than
+    real history. AAA has every input and should rank; BBB is missing a
+    sack reading for the target week and must be honestly absent.
+    """
+    defense_rankings = {
+        "WR": [{"team": "AAA", "raw_s2d": 27.0}, {"team": "BBB", "raw_s2d": 30.0}],
+        "TE": [{"team": "AAA", "raw_s2d": 9.0}, {"team": "BBB", "raw_s2d": 11.0}],
+        "RB": [],
+    }
+    team_tendencies = {
+        "AAA": {"points_allowed": {"air": {"s2d": 45.0}, "ground": {"s2d": 15.0}}},
+        "BBB": {"points_allowed": {"air": {"s2d": 38.0}, "ground": {"s2d": 12.0}}},
+    }
+    sack_rate = pd.DataFrame({
+        "team": ["AAA", "BBB"], "season": [2025, 2025], "week": [5, 4],  # BBB is week 4, not the target week
+        "sacks_per_game_ewm3": [2.0, 3.0], "sacks_per_game_s2d": [2.2, 3.1],
+    })
+
+    result = build_air_vulnerability_rankings(defense_rankings, team_tendencies, sack_rate, 2025, 5)
+
+    assert set(result.keys()) == {"AAA"}
+    assert result["AAA"]["rank"] == 1
+    assert result["AAA"]["pool_size"] == 1
+
+
+def test_attach_air_vulnerability_adds_the_key_without_dropping_teams_with_no_ranking():
+    team_tendencies = {"AAA": {"proe": {}}, "BBB": {"proe": {}}}
+    air_vulnerability = {"AAA": {"score": 1.0, "rank": 1, "pool_size": 1}}
+    out = attach_air_vulnerability(team_tendencies, air_vulnerability)
+    assert out["AAA"]["air_vulnerability"] == {"score": 1.0, "rank": 1, "pool_size": 1}
+    assert out["BBB"]["air_vulnerability"] is None
 
 
 # ==========================================================================

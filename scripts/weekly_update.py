@@ -55,7 +55,8 @@ import pandas as pd  # noqa: E402
 
 from src.artifacts import load_model_artifact  # noqa: E402
 from src.export import (  # noqa: E402
-    CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, build_defense_rankings,
+    CAVEATS, assemble_player_advanced_stats, assemble_simulation_block, attach_air_vulnerability,
+    build_air_vulnerability_rankings, build_defense_rankings,
     build_defense_stats_export, build_heatmap_snapshot, build_kicker_stats_export, build_matchup_simulation,
     build_matchup_snapshot, build_playoff_odds, build_player_simulation_metrics, build_radar_snapshot,
     build_starter_quantile_rows, build_target_week_features, build_team_game_id_lookup, build_team_tendencies,
@@ -72,6 +73,7 @@ from src.injury_report import build_practice_report_export  # noqa: E402
 from src.kicker_defense import build_defense_season_stats, build_kicker_season_stats  # noqa: E402
 from src.model import predict_quantiles_with_models, sleeper_projected_points  # noqa: E402
 from src.pipeline import _is_unpublished_season_error, build_raw_features, build_weekly_scored  # noqa: E402
+from src.usage import build_defense_sack_rate  # noqa: E402
 
 TOP_N_FREE_AGENTS = 300
 
@@ -402,6 +404,17 @@ def main() -> None:
     )
     print(f"    team tendencies: {len(team_tendencies)}/32 teams have enough prior games this season")
 
+    # Air-vulnerability index (PROJECT_CONTEXT.md's "Team-tendency PCA" --
+    # the one component of six that survived). Reuses defense_rankings'/
+    # team_tendencies' own already-point-in-time-safe WR/TE/air-allowed
+    # numbers rather than recomputing them; sacks is the one new input.
+    sack_rate = build_defense_sack_rate(combined_features, pbp_current)
+    air_vulnerability = build_air_vulnerability_rankings(
+        defense_rankings, team_tendencies, sack_rate, current_season, target_week
+    )
+    attach_air_vulnerability(team_tendencies, air_vulnerability)
+    print(f"    air vulnerability: {len(air_vulnerability)}/{len(team_tendencies)} teams ranked")
+
     # Per-player Monte Carlo: boom/bust + threshold probabilities, plus the
     # game_id + quantiles the dashboard needs for an ad-hoc start-over-
     # replacement comparison between any two exported players (see
@@ -449,6 +462,7 @@ def main() -> None:
         defense_rankings=defense_rankings,
         weekly_matchup=weekly_matchup,
         team_tendencies=team_tendencies,
+        air_vulnerability=air_vulnerability,
     )
     payload = merge_kicker_and_defense_entries(payload, kicker_export, defense_export)
     print(f"    crosswalk match rate: {crosswalk_report}")

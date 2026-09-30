@@ -3242,6 +3242,137 @@ test against the committed baseline before being added to `FEATURE_
 COLUMNS_BY_POSITION`). A future practice-report feature family would
 follow that same precedent, not skip it.
 
+## Team-tendency PCA findings (Sep 2026)
+
+A deliberate, stated-in-advance negative-result test: "my honest expectation
+is this may add nothing... a clean negative is a fine result." Two separate
+PCAs (offense, defense — mixing them collapses PC1 into "good team vs. bad
+team," which says nothing new) on **team-seasons, not teams**: 32 teams
+against 8 variables each is thin, so this pooled the three completed
+archived seasons (2023-2025) into 96 team-season observations per side,
+z-scored (every input standardized before fitting — seconds/play, percentages,
+and counts are on wildly different raw scales). Source data: the already-
+committed archive exports' `team_tendencies`, `defense_rankings`, and each
+DST entry's `defense_stats` — no new pipeline code needed for the analysis
+itself (only for what survived it, below).
+
+**Offense inputs** (PROE, plays/game, seconds/play, red-zone pass rate ≤20
+and ≤10, RB/WR/TE target share) — explained variance PC1 30.4%, PC2 25.5%,
+PC3 18.6% (74.6% cumulative through 3):
+- **PC1 = pass-heavy vs. run-heavy.** PROE + both red-zone pass rates load
+  together (+0.45/+0.57/+0.56). Correlates r=0.94 with a plain average of
+  those three raw stats — this is the predicted outcome exactly, and adds
+  nothing PROE doesn't already say on its own.
+- **PC2 = WR target share**, restated. Loads target_share_wr +0.63 against
+  target_share_rb/te negative — but correlates r=0.90 with `target_share_wr`
+  alone. Not new information.
+- **PC3 = pace/tempo** (plays/game +0.63, seconds/play −0.57 — a real
+  2-variable combination, neither alone gets above r=0.77) — a genuine
+  combination, but "fast teams run more plays" isn't a surprising finding.
+
+**Defense inputs** (xFP allowed to RB/WR/TE, air/ground points-allowed
+split, sacks, interceptions, points allowed) — explained variance PC1 41.1%,
+PC2 20.6%, PC3 13.0% (74.8% cumulative through 3):
+- **PC1 = general defensive quality** (good/bad across the board — ground
+  points allowed and RB xFP allowed load positive, air points/WR xFP/sacks/
+  interceptions load negative). r=0.67 with plain points-allowed/game — the
+  defense-only version of the "good team vs. bad team" collapse the offense/
+  defense split was specifically designed to avoid; expected, dropped.
+- **PC2 = air-vulnerability, independent of overall quality.** Loads air
+  points allowed +0.585, WR xFP allowed +0.419, TE xFP allowed +0.416, sacks
+  −0.354. **The one component that survived**: no single existing column
+  gets above r=0.75 against it (best: points allowed via the air alone), and
+  it separates "gets carved up through the air" from "bad defense overall"
+  — genuinely different information, not a column wearing a new name.
+- **PC3 = TE-specific vs. WR-specific vulnerability** (xFP allowed to TE
+  +0.762 against xFP allowed to WR −0.497). A nice story, but r=0.88 against
+  the plain arithmetic difference `xfp_allowed_te − xfp_allowed_wr` — a
+  subtraction of two numbers already on the page, not something that needed
+  PCA to find. Dropped.
+
+**Verdict: 5 of 6 components examined reduce to either one existing column
+or a hand-computable combination of two.** A chart built on any of those
+five would be worse than just showing the underlying stats directly — more
+moving parts, same information. Dropped, not built. **Defense PC2 is the
+exception** and shipped as a real pipeline feature:
+
+**The air-vulnerability index** (`src/export.py`: `AIR_VULNERABILITY_
+WEIGHTS`/`AIR_VULNERABILITY_REFERENCE`/`build_air_vulnerability_rankings`/
+`build_season_air_vulnerability_rankings`) — PC2's own loadings for exactly
+its four real inputs (air points allowed, WR xFP allowed, TE xFP allowed,
+sacks), re-normalized to sum to 1 in absolute value (0.3298/0.2362/0.2345/
+−0.1995) so they read as a plain weighted average of z-scores rather than an
+arbitrary-looking vector. Z-scored against a **frozen** reference (the same
+96-team-season pooled mean/std the PCA itself used, hardcoded as constants)
+rather than refit against whatever's in-season right now — early in a season
+there are only a handful of team-weeks to standardize against, which would
+make the same defense's index swing wildly week to week for no real reason;
+anchoring to a large, stable, historical baseline keeps the units comparable
+across weeks and seasons, the same reason the PCA itself pooled seasons
+rather than standardizing each one separately.
+
+Computed once in the pipeline (both `scripts/weekly_update.py`'s point-in-time
+path — `usage.py::build_defense_sack_rate`, the one genuinely new input,
+combined with the already-computed `defense_rankings`/`team_tendencies` — and
+`scripts/archive_season.py`'s whole-season retrospective path), not derived
+client-side, so it's computed once and exported rather than recomputed
+per-render in JS. Surfaced in two places: a new sortable "Air Vulnerability"
+column on the Team Tendencies table (rank, e.g. "4th of 32" — not the raw
+score, which has no natural units a reader could sanity-check on sight) and
+the Team Detail panel, plus the per-player matchup badge's tooltip for WR/TE
+specifically (`index.html::matchupIndicatorHtml`). **Framed deliberately as a
+derived statistic, not a football stat** — every surface's tooltip states
+plainly that it's "a derived statistical blend... not a stat you'd see quoted
+elsewhere," per the explicit instruction that came out of a PCA component
+needs that caveat everywhere it appears, not just once in a footnote.
+
+Two real bugs caught building this, neither from reading the code, both from
+running it end to end against live data:
+- **A stub-week scaffolding bug** (`build_defense_sack_rate`): the first
+  version only produced rows for weeks that actually appear in real pbp, so
+  the export's own target week (a stub row — nothing's been played there
+  yet) had no row for the point-in-time shift to land in at all. The live
+  weekly export came back with the air-vulnerability index ranking **zero
+  of 32 teams** — caught by actually running `scripts/weekly_update.py`, not
+  by a unit test, though a regression test now locks the fix (scaffolding
+  from the same `df`-provided row set `build_team_tendency_table` already
+  documents needing) in place: `tests/test_no_leakage.py::
+  test_defense_sack_rate_scaffolds_a_target_week_with_no_real_plays_yet`.
+- **The LA/LAR team-code inconsistency** (see the dedicated finding below)
+  — found while designing this feature's join, avoided by construction
+  (every input to the index stays in nflverse's own team-code space
+  throughout; the whole-season path recomputes sacks directly from pbp
+  rather than reusing `kicker_defense.py`'s Sleeper-keyed season total, for
+  exactly this reason) rather than needing a fix at the join site.
+
+**The LA/LAR team-code inconsistency.** `team_tendencies`/`defense_rankings`
+key every team by nflverse's own code (from real pbp/schedule columns); the
+`players`/`defense_stats` entries the SAME export's DST rows live under are
+re-keyed to Sleeper's convention (`NFLVERSE_TO_SLEEPER_TEAM`, already
+existed, `src/export.py`) because that dict is looked up by Sleeper's own
+player/roster ids elsewhere in the app. The two conventions differ for
+exactly one team — Rams: nflverse says `"LA"`, Sleeper says `"LAR"`. Checked
+directly whether any **currently shipped** code path joins across this
+boundary without converting: it does not — `team_tendencies`/`defense_
+rankings`/`matchup`/`weekly_matchup` are all built and consumed entirely
+within nflverse's own code space (opponent resolution comes from the same
+schedule/pbp source throughout), and the one place that reads BOTH spaces at
+once, `build_defense_stats_export`, already converts correctly. The gap was
+real but latent: nothing before this session's scratch PCA script had ever
+tried to join the two spaces directly, and that script silently dropped the
+Rams from three of 96 rows before the alias was found and fixed (see the
+prior session's diagnosis). Deliberately **not** fixed by renaming `team_
+tendencies`/`defense_rankings`'s keys to Sleeper's convention — that would
+also require re-normalizing `matchup.opponent`/`weekly_matchup[...].opponent`
+(read and displayed in several places in `index.html`) to match, a
+wider-blast-radius change than the actual problem warranted. Fixed instead by
+(1) making sure the new air-vulnerability code never crosses the boundary at
+all, by design, and (2) a regression test closing the one real coverage gap
+found: every existing `build_defense_stats_export` test used a team code
+identical in both conventions (`"KC"`), so the Rams conversion itself had
+never actually been exercised — `tests/test_export.py::
+test_build_defense_stats_export_converts_rams_la_to_sleeper_lar` now does.
+
 ## Verification status
 
 Be precise about what's actually been confirmed, so a fresh session doesn't inherit
@@ -3287,6 +3418,8 @@ assumptions as facts.
 | Practice Report tab: `build_practice_report_export` produces correct real data, `date_modified` genuinely doesn't exist in this source, and the tab renders/filters/sorts correctly for both the live 2026 week and a completed 2025 week | **Verified** — schema absence of `date_modified` confirmed at both the nflreadpy layer and the raw nflverse-data GitHub release directly (bypassing nflreadpy). Real committed exports patched with real data (not a re-run of the full slow prediction pipeline, which this feature doesn't touch): live `player_advanced_stats.json` carries 1 real week (52 skill-position report rows, `source_updated_at` matching the real GitHub release asset timestamp fetched live); the 2025 archive carries all 18 real weeks (1,790 total rows). A real JSON-round-trip bug was caught and fixed in the process: pandas silently reverts a `None` back to `NaN` on assignment into an all-null float64 column (`report_secondary_injury` most often), which produced a literal non-JSON `NaN` token — fixed by casting to `object` dtype before the null-fill. Frontend verified via Playwright against the real production data: season selector still defaults to 2026; the search box types forward correctly (built with the debounced-partial-render pattern from the start, not retrofitted); rostered/team/position filters and column-sort headers (including severity-ranked sort on the Practice/Report columns) all produce correct results; a row click opens the real Player Detail page; the default "relevance" sort correctly surfaces rostered players before free agents and higher-severity designations first within each group. Because this sandbox's headless Chromium is blocked by ESPN's bot detection (same pre-existing limitation noted elsewhere), the real live/upcoming practice-status branch was verified by intercepting the scoreboard request with a REAL just-captured ESPN snapshot (one real live game, DEN@KC in the 3rd quarter, week 1 2026) rather than a fabricated one — resulted in exactly 9 "Live" pills, matching the count of real DEN/KC starters across that week's matchups precisely; a "Not Started" state was confirmed by patching one real game's status field to `pre` in that same real snapshot. A real cross-provider discrepancy row (Ja'Marr Chase, 2025 Week 6, Illness vs. a differently-worded practice injury) was located and confirmed to render its "Official report:" annotation correctly. Not yet run for real on GitHub Actions infrastructure — `scripts/weekly_update.py`/`archive_season.py` were updated to build this key themselves going forward, but that path itself hasn't had a real `workflow_dispatch` since. |
 | Lineup Risks panel's `playProbability()` Q/D/O rates are measured, not guessed, and the measurement is representative of what the panel actually applies them to | **Verified** — re-measured specifically for this update (broader than the original Practice Report predictive analysis: QB/RB/WR/TE **+ K**, matching the Lineup Risks panel's own startable-position scope, and the FULL 2009-2025 history rather than the 2018-2025 model-training window) by joining every real nflverse `report_status` entry (`game_type == 'REG'`) to real weekly stats to determine whether the player actually recorded a stat line that week. Results: Questionable 56.66% (n=7,180 real player-weeks) → displayed as `~57%`; Doubtful 1.14% (n=1,057) → `~1%`; Out 0.058% (n=5,161) → `0%`. `index.html`'s `playProbability()` updated to these exact values with the real n stated in each tooltip. IR/PUP/NA/SUSP deliberately left at `0%` unchanged — checked directly and confirmed nflverse's `report_status` vocabulary has no equivalent concept for a roster-level designation (only ever Questionable/Doubtful/Out/Probable), so there is no rate to measure; their 0% is an NFL rule (IR's 4-game minimum, PUP's practice/play restriction, suspension ineligibility), not an estimate. Playwright-verified the updated tooltips/percentages render correctly in the real Lineup Risks panel, zero new console errors. |
 | QB xFP (`src/usage.py`'s dropback + designed-rush bucket model) is leakage-free, fumble/pick-six attribution is correct, and `fp_over_expected` behaves like a real luck signal for QB, not a re-labeled non-signal | **Verified** — 6 new white-box unit tests pass (`tests/test_no_leakage.py`: sack-yardage exclusion from passing_yards, scramble-yardage routing to rushing, fumble attribution to the QB not the receiver, pick-six detection's `td_team == defteam` gate, kneel/scramble/non-QB exclusion from the designed-rush population, QB-id filtering), plus the existing black-box future-truncation tests (`test_xfp_no_future_leakage`/`test_xfp_idempotent`) pass unchanged since they already exercised the full `weekly_scored` frame including QB rows. Split-half correlation (odd/even weeks within each player-season, >=3 games/half): QB raw `custom_points` r=0.7033 vs. `fp_over_expected` r=0.3676 (n=318) — a real, substantial drop, the metric passes the check. Reproduced the same test fresh for RB/WR/TE (pooled r=0.8048 raw vs. 0.1892 `fp_over_expected`, n=2,899-2,905) since the "0.22 vs. 0.73" figures once recalled for the original xFP weren't found committed anywhere to verify against directly. Real 2025 season spot-check via a locally-regenerated `scripts/archive_season.py 2025` (not a scratch computation) matches known outcomes: Josh Allen +80.5, Drake Maye +72.6, Matthew Stafford +58.0 at the positive extreme (real efficient/high-conversion 2025 seasons); Cam Ward −58.5, Geno Smith −43.4 at the negative extreme (real, widely-reported down seasons). Playwright-verified live: the Dashboard's xFP Regression panel and the Players table's FP Over Exp column both now show real QB values mixed naturally with RB/WR/TE (no separate QB section, no dashes), zero console errors. See **QB xFP findings** for the full bucket counts, the fumble-attribution fix, the scramble-dilution measurement (confirmed negligible, left as-is), and the QB-confidence UI copy update. |
+
+| Team-tendency PCA: 5 of 6 components reduce to an existing column or a hand-computable combination; the air-vulnerability index (defense PC2) is real pipeline output, not a JS-side derivation | **Verified** — quantified via direct correlation against every candidate single-stat/combination explanation (see **Team-tendency PCA findings** for the full r-values). `build_air_vulnerability_rankings`/`build_season_air_vulnerability_rankings` re-run for real: all 3 archives (2023/2024/2025) and the live export ranked 32/32 teams, `validate_export`'s new rank-range check passed on all 4. Frontend verified via Playwright against the real regenerated live export: the Team Tendencies table's new sortable column, the Team Detail panel, and a real WR's (Jaxon Smith-Njigba) matchup-badge tooltip all rendered the correct rank with the derived-statistic caveat text present. Two real bugs caught running the pipeline end to end (not by reading the code): a stub-week scaffolding gap that ranked 0/32 teams for the live path until fixed, and confirmation that the pre-existing LA/LAR team-code split (nflverse vs. Sleeper) doesn't currently affect any shipped join — both now covered by regression tests. Full test suite: 203 passed (up from 191). |
 
 ## What's outstanding
 

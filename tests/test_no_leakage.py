@@ -63,8 +63,10 @@ from src.usage import (  # noqa: E402
     add_volume_features,
     add_xfp_features,
     build_defense_air_ground_split,
+    build_defense_sack_rate,
     build_defense_strength_table,
     DEFENSE_AIR_GROUND_OUTPUT_COLUMNS,
+    DEFENSE_SACK_RATE_OUTPUT_COLUMNS,
     _bucket_rate_table,
     _dropback_play_frame,
     _qb_player_ids,
@@ -697,6 +699,68 @@ def test_defense_air_ground_split_produces_real_values(featured_df, pbp, schedul
     assert len(real) > 100
     assert (real["xfp_allowed_air_s2d"] >= 0).all()
     assert (real["xfp_allowed_ground_s2d"] >= 0).all()
+
+
+@pytest.mark.parametrize("season,boundary_week", BOUNDARIES)
+def test_defense_sack_rate_no_future_leakage(featured_df, pbp, season, boundary_week):
+    """Same black-box truncate-and-compare pattern as build_defense_air_
+    ground_split's own leakage test just above."""
+    pbp_truncated = _truncate_after(pbp, season, boundary_week)
+
+    full = build_defense_sack_rate(featured_df, pbp)
+    truncated = build_defense_sack_rate(featured_df, pbp_truncated)
+
+    mask = (full["season"] == season) & (full["week"] <= boundary_week)
+    cols = ["team", "season", "week"] + DEFENSE_SACK_RATE_OUTPUT_COLUMNS
+    left = full.loc[mask, cols].sort_values(["team", "week"]).reset_index(drop=True)
+    right = truncated.loc[mask, cols].sort_values(["team", "week"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(left, right)
+
+
+def test_defense_sack_rate_produces_real_values(featured_df, pbp):
+    """Sanity check on the plumbing: once a season has a real handful of
+    games, real teams should have a non-null, non-negative sacks-per-game
+    reading."""
+    table = build_defense_sack_rate(featured_df, pbp)
+    real = table.dropna(subset=DEFENSE_SACK_RATE_OUTPUT_COLUMNS)
+    assert len(real) > 100
+    assert (real["sacks_per_game_s2d"] >= 0).all()
+
+
+def test_defense_sack_rate_scaffolds_a_target_week_with_no_real_plays_yet():
+    """
+    Direct regression test for a real bug caught running the live pipeline
+    end to end, not by a unit test: the first version of
+    build_defense_sack_rate had no stub-week scaffolding (unlike build_
+    team_tendency_table, which explicitly documents needing one), so a
+    target week with no real games played yet -- the export's own
+    "predict this week" stub row -- produced NO row at all in this table.
+    The air-vulnerability index that depends on it came back with zero
+    teams ranked for the live weekly export as a result. This locks the
+    fix (scaffolding from df's own team/season/week rows) in place.
+    """
+    pbp = pd.DataFrame({
+        "season_type": ["REG"] * 4,
+        "season": [2025] * 4,
+        "week": [1, 1, 2, 2],
+        "defteam": ["KC", "SF", "KC", "SF"],
+        "sack": [2, 1, 4, 0],
+    })
+    # df's own scaffold includes week 3 -- a real target week with no pbp
+    # rows yet (nothing played there so far), the exact shape
+    # build_target_week_features' own stub row takes.
+    df = pd.DataFrame({
+        "team": ["KC", "SF", "KC", "SF", "KC", "SF"],
+        "season": [2025] * 6,
+        "week": [1, 1, 2, 2, 3, 3],
+    })
+
+    out = build_defense_sack_rate(df, pbp)
+    week3 = out[(out["team"] == "KC") & (out["week"] == 3)]
+    assert len(week3) == 1
+    # shift(1) of the expanding mean through week 2: (2 + 4) / 2 = 3.0
+    assert week3["sacks_per_game_s2d"].iloc[0] == pytest.approx(3.0)
+    assert not pd.isna(week3["sacks_per_game_ewm3"].iloc[0])
 
 
 def test_rolling_features_shift_excludes_own_week(featured_df):

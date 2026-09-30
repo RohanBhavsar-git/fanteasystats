@@ -1643,6 +1643,70 @@ def build_defense_air_ground_split(
     })[["team", "season", "week"] + DEFENSE_AIR_GROUND_OUTPUT_COLUMNS]
 
 
+DEFENSE_SACK_RATE_OUTPUT_COLUMNS = ["sacks_per_game_ewm3", "sacks_per_game_s2d"]
+
+
+def build_defense_sack_rate(df: pd.DataFrame, pbp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per (team, season, week): this DEFENSE's own trailing sacks-per-game
+    rate, point-in-time-safe the same window-then-shift(1) recipe as
+    build_defense_air_ground_split/build_defense_strength_table. A real
+    pass-rush signal neither of those covers on its own -- both describe
+    fantasy points ALLOWED, not how the defense generates its own
+    production. Feeds export.py's air-vulnerability index (a defense that
+    doesn't get to the quarterback tends to allow more through the air).
+
+    `df` provides the same scaffold build_team_tendency_table's own
+    docstring explains in detail: pbp has no rows at all for a week that
+    hasn't been played yet (the target week being predicted), so a
+    pbp-only row set would never produce a row THAT week for the shift(1)
+    below to land in, and this would come back null for the one week a
+    live weekly export actually needs it for -- caught exactly this way,
+    by running against a real live export and finding target week's
+    ranking came back with zero teams. Scaffolding from df's own (team,
+    season, week) rows (its target-week stub included) gives that week a
+    row with a NaN raw sack count for the week itself -- correct, nothing
+    real happened yet -- while shift(1) still resolves its _s2d/_ewm3 from
+    the real prior weeks.
+
+    Args:
+        df: any frame with team, season, week (weekly_scored or later is
+            fine) -- only used to seed the row scaffold, same role it
+            plays in build_team_tendency_table.
+        pbp: from get_pbp(). Real sack counts, defteam-side.
+
+    Returns:
+        team, season, week, sacks_per_game_ewm3, sacks_per_game_s2d. Null
+        wherever the team has no prior in-season game yet, same convention
+        as build_defense_air_ground_split.
+    """
+    required = ["season_type", "season", "defteam", "sack"]
+    missing = [c for c in required if c not in pbp.columns]
+    if missing:
+        raise KeyError(f"build_defense_sack_rate: pbp is missing columns {missing}")
+    required_df = ["team", "season", "week"]
+    missing_df = [c for c in required_df if c not in df.columns]
+    if missing_df:
+        raise KeyError(f"build_defense_sack_rate: df is missing columns {missing_df}")
+
+    reg_pbp = pbp[pbp["season_type"] == "REG"]
+    weekly_sacks = (
+        reg_pbp.groupby(["defteam", "season", "week"])["sack"].sum()
+        .reset_index().rename(columns={"defteam": "team", "sack": "sacks"})
+    )
+    scaffold = df[["team", "season", "week"]].drop_duplicates()
+    weekly_sacks = weekly_sacks.merge(scaffold, on=["team", "season", "week"], how="outer")
+    # _rolling_team_position needs a `position` column to group by -- a
+    # constant fills that slot without changing what the groupby actually
+    # partitions on, the same trick build_defense_air_ground_split's own
+    # position-less xfp_air/xfp_ground already uses.
+    weekly_sacks["position"] = "ALL"
+    rolled = _rolling_team_position(weekly_sacks, "sacks")
+    return rolled.rename(columns={
+        "sacks_ewm3": "sacks_per_game_ewm3", "sacks_s2d": "sacks_per_game_s2d",
+    })[["team", "season", "week"] + DEFENSE_SACK_RATE_OUTPUT_COLUMNS]
+
+
 def add_opponent_strength_features(df: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
     """
     Add OPPONENT_STRENGTH_OUTPUT_COLUMNS: how strong THIS WEEK's opponent's
