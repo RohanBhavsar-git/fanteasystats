@@ -111,6 +111,12 @@ league is 0.5. Train on `custom_points`.
 - **Verify before claiming.** "This should work" and "I ran this and it
   reported 0 mismatches" are different statements. Use the second only when
   it's true.
+- **`git pull` before diagnosing anything.** `weekly-update.yml` commits to
+  `main` every Tuesday, straight from CI — a local checkout that's behind
+  looks *exactly* like a broken pipeline (stale `meta.week`, an old
+  `generated_at`) even though the real, current export is sitting on
+  `origin/main` the whole time. Pull first; only trust what's committed
+  locally as "the live state" after confirming it matches `origin/main`.
 
 ## Commands
 
